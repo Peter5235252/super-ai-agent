@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod md;
+mod stt;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -199,6 +200,8 @@ enum UiUpdate {
         provider: String,
         models: Vec<ModelInfo>,
     },
+    /// Speech-to-text finished: transcribed draft text, or a plain error.
+    SttDone(Result<String, String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +261,14 @@ struct SuperAiApp {
     mode_mirror: AgentMode,
     /// Last ESC keypress, for the double-ESC stop gesture.
     last_esc: Option<std::time::Instant>,
+    /// Live microphone capture (Some while recording).
+    stt: Option<stt::Recorder>,
+    /// A transcription/download is running in the background.
+    stt_working: bool,
+    /// Focus the composer on the next frame (e.g. after opening a session).
+    focus_composer: bool,
+    /// A binding change is being saved (guards the seamless auto-rebind).
+    rebinding: bool,
 
     show_providers: bool,
     new_workspace: String,
@@ -316,6 +327,10 @@ impl SuperAiApp {
             effort_sel: None,
             mode_mirror: mode,
             last_esc: None,
+            stt: None,
+            stt_working: false,
+            focus_composer: false,
+            rebinding: false,
             show_providers: false,
             new_workspace: String::new(),
             draft: String::new(),
@@ -428,6 +443,7 @@ impl SuperAiApp {
                 .as_deref()
                 .and_then(ReasoningEffort::parse);
         }
+        self.focus_composer = true;
         self.load_messages(id);
     }
 
@@ -503,6 +519,62 @@ impl SuperAiApp {
 
     fn toggle_mode(&mut self) {
         self.set_mode(self.mode_mirror.toggle());
+    }
+
+    fn start_mic(&mut self) {
+        if self.stt_working {
+            return;
+        }
+        match stt::start_recording() {
+            Ok(rec) => {
+                self.notice = Some(format!(
+                    "Listening on {} — click the mic again to transcribe.",
+                    rec.device_name
+                ));
+                self.stt = Some(rec);
+            }
+            Err(e) => self.notice = Some(e),
+        }
+    }
+
+    fn stop_and_transcribe(&mut self) {
+        let Some(rec) = self.stt.take() else {
+            return;
+        };
+        let recording = rec.finish();
+        if recording.samples.is_empty() {
+            self.notice = Some("Nothing recorded.".to_string());
+            return;
+        }
+        self.stt_working = true;
+        self.notice = Some("Transcribing… (first use downloads a 75 MB speech model)".to_string());
+        let tx = self.tx.clone();
+        self.spawn(async move {
+            let pcm = stt::to_mono_16k(
+                &recording.samples,
+                recording.channels,
+                recording.sample_rate,
+            );
+            if stt::peak(&pcm) < stt::SILENCE_PEAK {
+                let _ = tx.send(UiUpdate::SttDone(Err(
+                    "Too quiet — heard nothing. Try speaking closer to the mic.".to_string(),
+                )));
+                return;
+            }
+            let dir = data_dir();
+            match stt::ensure_model(&dir).await {
+                Ok(path) => {
+                    let out = tokio::task::spawn_blocking(move || stt::transcribe(&path, &pcm))
+                        .await
+                        .map_err(|e| format!("Transcription crashed: {e}"))
+                        .and_then(|r| r);
+                    let _ = tx.send(UiUpdate::SttDone(out));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiUpdate::SttDone(Err(e)));
+                }
+            }
+        });
     }
 
     /// Double-ESC stop gesture: first press arms, second press (within
@@ -613,7 +685,7 @@ impl SuperAiApp {
             match db.bind_provider(session_id, &provider, &model).await {
                 Ok(()) => {
                     let _ = tx.send(UiUpdate::Notice(format!(
-                        "Bound {provider} / {model} to this session"
+                        "Now using {provider} / {model} — history kept, applies to your next message"
                     )));
                     match db.list_sessions().await {
                         Ok(rows) => {
@@ -824,7 +896,10 @@ impl SuperAiApp {
         while let Ok(update) = self.rx.try_recv() {
             match update {
                 UiUpdate::Notice(n) => self.notice = Some(n),
-                UiUpdate::Sessions(rows) => self.sessions = rows,
+                UiUpdate::Sessions(rows) => {
+                    self.sessions = rows;
+                    self.rebinding = false;
+                }
                 UiUpdate::SessionCreated(row) => {
                     let id = row.id;
                     self.refresh_sessions();
@@ -873,6 +948,26 @@ impl SuperAiApp {
                     if provider == self.browser_provider {
                         self.browser_models = models;
                         self.browser_loading = false;
+                    }
+                }
+                UiUpdate::SttDone(result) => {
+                    self.stt_working = false;
+                    match result {
+                        Ok(text) => {
+                            if text.trim().is_empty() {
+                                self.notice = Some(
+                                    "Heard nothing — try speaking closer to the mic.".to_string(),
+                                );
+                            } else {
+                                if !self.draft.is_empty()
+                                    && !self.draft.ends_with(char::is_whitespace)
+                                {
+                                    self.draft.push(' ');
+                                }
+                                self.draft.push_str(text.trim());
+                            }
+                        }
+                        Err(e) => self.notice = Some(e),
                     }
                 }
             }
@@ -1554,19 +1649,6 @@ impl eframe::App for SuperAiApp {
                                 .weak(),
                             );
                         }
-                        let can_apply =
-                            !self.provider_sel.is_empty() && !self.model_sel.trim().is_empty();
-                        if ui
-                            .add_enabled(can_apply, egui::Button::new("Apply"))
-                            .clicked()
-                        {
-                            self.apply_binding();
-                        }
-                        // Guided picker instead of a raw model id: friendly
-                        // names, prices, live server list. Custom ids still
-                        // work via the picker's "Custom" field. Binding can
-                        // change any time, even mid-conversation — history
-                        // is kept, the next answer uses the new model.
                         let model_label = if self.model_sel.trim().is_empty() {
                             "Choose model…".to_string()
                         } else {
@@ -1574,7 +1656,7 @@ impl eframe::App for SuperAiApp {
                         };
                         if ui
                             .button(model_label)
-                            .on_hover_text("Pick a model (changeable any time)")
+                            .on_hover_text("Pick a model — switches instantly, history kept")
                             .clicked()
                         {
                             self.open_models();
@@ -1608,6 +1690,25 @@ impl eframe::App for SuperAiApp {
                             ui.label(egui::RichText::new("no providers").small().weak());
                             if ui.button("Add provider").clicked() {
                                 self.show_providers = true;
+                            }
+                        }
+                        // Seamless switching: a complete selection that
+                        // differs from the stored binding rebinds instantly —
+                        // no Apply step, history kept, takes effect on the
+                        // next message (an in-flight answer keeps its model).
+                        if !self.rebinding {
+                            let want_p = self.provider_sel.trim().to_string();
+                            let want_m = self.model_sel.trim().to_string();
+                            if let Some(s) = &active {
+                                let bound_p = s.provider_name.clone().unwrap_or_default();
+                                let bound_m = s.model.clone().unwrap_or_default();
+                                if !want_p.is_empty()
+                                    && !want_m.is_empty()
+                                    && (want_p != bound_p || want_m != bound_m)
+                                {
+                                    self.rebinding = true;
+                                    self.apply_binding();
+                                }
                             }
                         }
                     } else {
@@ -1832,6 +1933,7 @@ impl eframe::App for SuperAiApp {
                 };
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut self.draft)
+                        .id(egui::Id::new("composer"))
                         .desired_rows(2)
                         .hint_text(hint)
                         .desired_width(f32::INFINITY),
@@ -1849,6 +1951,38 @@ impl eframe::App for SuperAiApp {
                 if tab {
                     toggle = true;
                 }
+                // Microphone right of the message bar: toggle to dictate.
+                let rec_on = self.stt.is_some();
+                if ui
+                    .add_enabled(
+                        !self.stt_working,
+                        egui::Button::selectable(
+                            rec_on,
+                            li(if rec_on { Icon::Square } else { Icon::Mic }).strong(),
+                        ),
+                    )
+                    .on_hover_text(if rec_on {
+                        "Stop and transcribe"
+                    } else {
+                        "Dictate with microphone"
+                    })
+                    .clicked()
+                {
+                    if self.stt.is_some() {
+                        self.stop_and_transcribe();
+                    } else {
+                        self.start_mic();
+                    }
+                }
+                if let Some(rec) = &self.stt {
+                    let secs = rec.elapsed().as_secs();
+                    ui.label(
+                        egui::RichText::new(format!("● {:02}:{:02}", secs / 60, secs % 60))
+                            .small()
+                            .strong()
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                }
                 let can_send =
                     self.active_id.is_some() && !self.streaming && !self.draft.trim().is_empty();
                 if ui
@@ -1861,6 +1995,17 @@ impl eframe::App for SuperAiApp {
             });
             if toggle {
                 self.toggle_mode();
+            }
+            // Recording auto-stops at the cap so a forgotten mic can't run on.
+            if let Some(rec) = &self.stt {
+                if rec.elapsed() > std::time::Duration::from_secs(stt::MAX_RECORD_SECS) {
+                    self.stop_and_transcribe();
+                }
+            }
+            // Focus the composer after opening a session.
+            if self.focus_composer {
+                self.focus_composer = false;
+                ui.memory_mut(|m| m.request_focus(egui::Id::new("composer")));
             }
             ui.add_space(4.0);
         });
@@ -2299,6 +2444,7 @@ impl eframe::App for SuperAiApp {
                                 && !self.browser_custom.trim().is_empty()
                             {
                                 self.model_sel = self.browser_custom.trim().to_string();
+                                self.provider_sel = self.browser_provider.clone();
                                 self.browser_custom.clear();
                                 self.show_models = false;
                             }
@@ -2334,7 +2480,10 @@ impl eframe::App for SuperAiApp {
                                 }
                             });
                         if let Some(id) = pick {
+                            // Picking rebinds instantly (provider included);
+                            // the header auto-applies on the next frame.
                             self.model_sel = id;
+                            self.provider_sel = self.browser_provider.clone();
                             self.show_models = false;
                         }
                     }
@@ -2491,6 +2640,8 @@ mod tests {
             Icon::Send,
             Icon::RefreshCw,
             Icon::Brain,
+            Icon::Mic,
+            Icon::Square,
         ];
         let mut missing = Vec::new();
         for ic in used {
@@ -2539,6 +2690,8 @@ mod tests {
             Icon::Send,
             Icon::RefreshCw,
             Icon::Brain,
+            Icon::Mic,
+            Icon::Square,
         ];
         let mut missing = Vec::new();
         for ic in used {
