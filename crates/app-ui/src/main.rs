@@ -16,15 +16,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use agent_runtime::{Agent, AgentEvent, TaskRequest, TaskSummary, ToolRegistry};
-use app_core::{AgentMode, ApprovalDecision, RiskClass, WorkspaceConfig, now_ms};
+use app_core::{AgentMode, ApprovalDecision, RiskClass, SideEffect, WorkspaceConfig, now_ms};
 use futures::StreamExt;
 use lucide_icons::Icon;
 use persistence::{Db, MessageRow, ProviderRow, SessionRow};
-use policy_engine::PolicyEngine;
+use policy_engine::{Decision, PolicyEngine};
 use provider_api::ReasoningEffort;
 use provider_api::{Message, MessageRole, ModelInfo, ModelProvider};
 use secrecy::SecretString;
 use tokio::sync::broadcast;
+use tool_core::{Tool, ToolContext};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -202,6 +203,15 @@ enum UiUpdate {
     },
     /// Speech-to-text finished: transcribed draft text, or a plain error.
     SttDone(Result<String, String>),
+    /// Self-test results for the diagnostics modal.
+    Diagnostics(Vec<DiagRow>),
+}
+
+/// One self-test row: `ok` is None for "skipped".
+struct DiagRow {
+    name: String,
+    ok: Option<bool>,
+    detail: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +279,10 @@ struct SuperAiApp {
     focus_composer: bool,
     /// A binding change is being saved (guards the seamless auto-rebind).
     rebinding: bool,
+    /// Diagnostics modal + last results + running flag.
+    show_diags: bool,
+    diags: Vec<DiagRow>,
+    diags_running: bool,
 
     show_providers: bool,
     new_workspace: String,
@@ -331,6 +345,9 @@ impl SuperAiApp {
             stt_working: false,
             focus_composer: false,
             rebinding: false,
+            show_diags: false,
+            diags: Vec::new(),
+            diags_running: false,
             show_providers: false,
             new_workspace: String::new(),
             draft: String::new(),
@@ -817,6 +834,82 @@ impl SuperAiApp {
         });
     }
 
+    /// Self-test: exercises the real database, workspace, policy gate,
+    /// filesystem tool, terminal tool and model connection — so a broken
+    /// approval pipeline (or anything else) shows up as a named failure
+    /// instead of silence. No model tokens spent, nothing modified.
+    fn run_diagnostics(&mut self) {
+        self.diags_running = true;
+        self.diags.clear();
+        self.show_diags = true;
+        let db = self.db.clone();
+        let tx = self.tx.clone();
+        let provider_name = self
+            .active_id
+            .and_then(|id| {
+                self.sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.provider_name.clone())
+            })
+            .or_else(|| self.providers.first().map(|p| p.name.clone()));
+        self.spawn(async move {
+            let mut rows = Vec::new();
+            let mut row = |name: &str, r: Result<String, String>| match r {
+                Ok(detail) => rows.push(DiagRow {
+                    name: name.to_string(),
+                    ok: Some(true),
+                    detail,
+                }),
+                Err(detail) => rows.push(DiagRow {
+                    name: name.to_string(),
+                    ok: Some(false),
+                    detail,
+                }),
+            };
+
+            row(
+                "Database",
+                match db.list_sessions().await {
+                    Ok(s) => Ok(format!("sessions table readable ({} sessions)", s.len())),
+                    Err(e) => Err(format!("unreadable: {e}")),
+                },
+            );
+
+            let dir = default_workspace_dir();
+            row(
+                "Workspace folder",
+                match std::fs::create_dir_all(&dir)
+                    .and_then(|_| std::fs::read_dir(&dir).map(|_| ()))
+                {
+                    Ok(()) => Ok(format!("usable: {}", dir.display())),
+                    Err(e) => Err(format!("can't use {}: {e}", dir.display())),
+                },
+            );
+
+            row("Approval gate", probe_approval_gate().await);
+            row("File tools (list)", probe_fs_list(&dir).await);
+            row("Terminal tool", probe_process(&dir).await);
+
+            match provider_name {
+                Some(name) => {
+                    let r = match test_provider_inner(&db, &name).await {
+                        Ok(msg) => Ok(msg),
+                        Err(e) => Err(e),
+                    };
+                    row(&format!("Model connection ({name})"), r);
+                }
+                None => rows.push(DiagRow {
+                    name: "Model connection".to_string(),
+                    ok: None,
+                    detail: "skipped: add a provider first".to_string(),
+                }),
+            }
+
+            let _ = tx.send(UiUpdate::Diagnostics(rows));
+        });
+    }
+
     /// Open the guided model browser for the currently picked provider.
     fn open_models(&mut self) {
         if self.browser_provider.is_empty() {
@@ -969,6 +1062,10 @@ impl SuperAiApp {
                         }
                         Err(e) => self.notice = Some(e),
                     }
+                }
+                UiUpdate::Diagnostics(rows) => {
+                    self.diags = rows;
+                    self.diags_running = false;
                 }
             }
         }
@@ -1228,6 +1325,86 @@ async fn provider_for(
 async fn load_models_inner(db: &Db, name: &str) -> Result<Vec<ModelInfo>, String> {
     let (provider, _) = provider_for(db, name).await?;
     provider.list_models().await.map_err(|e| format!("{e}"))
+}
+
+/// Approval-gate probe: runs a fake medium-risk write through a fresh
+/// policy engine and completes the human round-trip. Proves the exact
+/// machinery behind approval cards works (raise → answer → resolve).
+async fn probe_approval_gate() -> Result<String, String> {
+    let policy = PolicyEngine::new(RiskClass::Low);
+    let def = tool_core::ToolDefinition::new(
+        "diag.probe",
+        "diagnostic probe (never executed)",
+        serde_json::json!({"type": "object"}),
+        RiskClass::Medium,
+        vec![SideEffect::WritesFiles],
+    );
+    match policy
+        .authorize(&def, &serde_json::Value::Null, &ToolContext::default())
+        .await
+    {
+        Decision::PendingApproval { id, receiver, .. } => {
+            policy.respond(id, ApprovalDecision::AllowOnce).await;
+            match receiver.await {
+                Ok(ApprovalDecision::AllowOnce) => {
+                    Ok("raise → answer → resolve round-trip works".to_string())
+                }
+                Ok(other) => Err(format!("gate answered wrong: {other:?}")),
+                Err(_) => Err("approval answer got lost".to_string()),
+            }
+        }
+        Decision::Allow => Err("expected an approval gate, got auto-allow".to_string()),
+        Decision::Deny { reason } => Err(format!("unexpected deny: {reason}")),
+    }
+}
+
+/// Filesystem probe: runs the real `fs.list` tool against the workspace.
+async fn probe_fs_list(dir: &std::path::Path) -> Result<String, String> {
+    let tools = tool_filesystem::filesystem_tools(dir.to_path_buf());
+    let list = tools
+        .into_iter()
+        .find(|t| t.definition().name == "fs.list")
+        .ok_or_else(|| "fs.list tool missing".to_string())?;
+    let ctx = ToolContext {
+        workspace: Some(WorkspaceConfig::from_dir("diag", dir.to_path_buf())),
+        cwd: Some(dir.to_path_buf()),
+    };
+    let out = list
+        .execute(serde_json::json!({"path": "."}), &ctx)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(format!("fs.list works ({} chars listed)", out.output.len()))
+}
+
+/// Terminal probe: runs one harmless echo through the real `process.run`.
+async fn probe_process(dir: &std::path::Path) -> Result<String, String> {
+    let tools = tool_process::process_tools();
+    let run = tools
+        .into_iter()
+        .find(|t| t.definition().name == "process.run")
+        .ok_or_else(|| "process.run tool missing".to_string())?;
+    let ctx = ToolContext {
+        workspace: Some(WorkspaceConfig::from_dir("diag", dir.to_path_buf())),
+        cwd: Some(dir.to_path_buf()),
+    };
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        run.execute(
+            serde_json::json!({"shell": "powershell", "command": "Write-Output diag-ok", "timeout_ms": 15000}),
+            &ctx,
+        ),
+    )
+    .await
+    .map_err(|_| "terminal call timed out".to_string())
+    .and_then(|r| r.map_err(|e| format!("{e:#}")))?;
+    if out.output.contains("diag-ok") && out.output.contains("exit: 0") {
+        Ok("PowerShell round-trip works".to_string())
+    } else {
+        Err(format!(
+            "unexpected output: {}",
+            out.output.chars().take(200).collect::<String>()
+        ))
+    }
 }
 
 async fn test_provider_inner(db: &Db, name: &str) -> Result<String, String> {
@@ -1624,6 +1801,13 @@ impl eframe::App for SuperAiApp {
         if esc {
             self.handle_esc();
         }
+        // Ctrl+Tab toggles Plan/Build from anywhere (Tab alone also works
+        // while typing in the composer).
+        let mode_key =
+            ui.input_mut(|i| i.count_and_consume_key(egui::Modifiers::CTRL, egui::Key::Tab) != 0);
+        if mode_key {
+            self.toggle_mode();
+        }
         let ctx = ui.ctx().clone();
 
         let active = self
@@ -1864,6 +2048,16 @@ impl eframe::App for SuperAiApp {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("v0.2.0 · BYOK").weak().small());
                     ui.horizontal(|ui| {
+                        ui.label(li(Icon::Stethoscope));
+                        if ui
+                            .button("Diagnostics")
+                            .on_hover_text("Self-test: database, tools, approval gate, model")
+                            .clicked()
+                        {
+                            self.run_diagnostics();
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         ui.label(li(Icon::Settings));
                         if ui.button("Providers & keys").clicked() {
                             self.show_providers = true;
@@ -1927,7 +2121,7 @@ impl eframe::App for SuperAiApp {
                     .and_then(|s| s.provider_name.as_ref())
                     .is_some()
                 {
-                    "Ask the agent something… (Enter sends · Tab switches mode · ESC×2 stops)"
+                    "Ask the agent something… (Enter sends · Tab / Ctrl+Tab switches mode · ESC×2 stops)"
                 } else {
                     "Bind a provider and model above first…"
                 };
@@ -1983,13 +2177,27 @@ impl eframe::App for SuperAiApp {
                             .color(egui::Color32::LIGHT_RED),
                     );
                 }
-                let can_send =
-                    self.active_id.is_some() && !self.streaming && !self.draft.trim().is_empty();
+                // Send stays clickable so it always answers: empty draft
+                // and busy agent explain themselves instead of dead clicks.
+                let can_send = self.active_id.is_some();
                 if ui
                     .add_enabled(can_send, egui::Button::new("Send"))
+                    .on_hover_text("Send (Enter)")
                     .clicked()
-                    || (enter && can_send)
+                    && can_send
                 {
+                    if self.draft.trim().is_empty() {
+                        self.notice = Some("Type a message first.".to_string());
+                    } else if self.streaming {
+                        self.notice = Some(
+                            "The agent is still working — ESC×2 stops it, or wait for it to finish."
+                                .to_string(),
+                        );
+                    } else {
+                        self.queue_send();
+                    }
+                }
+                if enter && can_send && !self.streaming && !self.draft.trim().is_empty() {
                     self.queue_send();
                 }
             });
@@ -2012,6 +2220,27 @@ impl eframe::App for SuperAiApp {
 
         // -- center: conversation + approvals + activity ----------------------
         egui::CentralPanel::default().show(ui, |ui| {
+            // Unmissable banner while anything awaits approval.
+            if !self.approvals.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            li(Icon::TriangleAlert)
+                                .strong()
+                                .color(egui::Color32::from_rgb(250, 204, 21)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} action{} need{} your approval to continue — see below",
+                                self.approvals.len(),
+                                if self.approvals.len() == 1 { "" } else { "s" },
+                                if self.approvals.len() == 1 { "s" } else { "" },
+                            ))
+                            .strong(),
+                        );
+                    });
+                });
+            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
@@ -2491,6 +2720,55 @@ impl eframe::App for SuperAiApp {
             self.show_models = open;
         }
 
+        // -- diagnostics modal ------------------------------------------------
+        if self.show_diags {
+            let mut open = self.show_diags;
+            egui::Window::new("Diagnostics")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(560.0)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Self-test for the whole pipeline. No tokens spent, nothing modified. \
+                             If the AI answers but never acts, check the model supports tool \
+                             calling (small local models often don't).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+                    if self.diags_running && self.diags.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Running checks…");
+                        });
+                    }
+                    for row in self.diags.clone() {
+                        ui.horizontal(|ui| {
+                            let (ic, color) = match row.ok {
+                                Some(true) => (Icon::Check, egui::Color32::LIGHT_GREEN),
+                                Some(false) => (Icon::X, egui::Color32::LIGHT_RED),
+                                None => (Icon::Minus, egui::Color32::GRAY),
+                            };
+                            ui.label(li(ic).color(color));
+                            ui.label(egui::RichText::new(&row.name).strong());
+                        });
+                        ui.label(egui::RichText::new(&row.detail).small().weak());
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Re-run").clicked() {
+                            self.run_diagnostics();
+                        }
+                        if ui.button("Close").clicked() {
+                            self.show_diags = false;
+                        }
+                    });
+                });
+            self.show_diags = open;
+        }
+
         if self.send_requested {
             self.send_requested = false;
             self.do_send();
@@ -2598,7 +2876,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_fonts(app_fonts());
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            let mut visuals = egui::Visuals::dark();
+            visuals.hyperlink_color = egui::Color32::from_rgb(96, 165, 250);
+            cc.egui_ctx.set_visuals(visuals);
             Ok(Box::new(SuperAiApp::new(
                 db, policy, agent, handle, ui_tx, ui_rx, saved_mode,
             )))
@@ -2642,6 +2922,8 @@ mod tests {
             Icon::Brain,
             Icon::Mic,
             Icon::Square,
+            Icon::Stethoscope,
+            Icon::Minus,
         ];
         let mut missing = Vec::new();
         for ic in used {
@@ -2692,6 +2974,8 @@ mod tests {
             Icon::Brain,
             Icon::Mic,
             Icon::Square,
+            Icon::Stethoscope,
+            Icon::Minus,
         ];
         let mut missing = Vec::new();
         for ic in used {
