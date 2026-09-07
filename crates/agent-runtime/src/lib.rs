@@ -200,7 +200,7 @@ impl ToolRegistry {
 pub struct Agent {
     pub policy: Arc<PolicyEngine>,
     pub events: broadcast::Sender<AgentEvent>,
-    live: std::sync::Mutex<Vec<tokio::task::JoinHandle<TaskSummary>>>,
+    live: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 const STREAM_RETRIES: u32 = 2;
