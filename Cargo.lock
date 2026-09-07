@@ -122,6 +122,7 @@ dependencies = [
  "secrecy",
  "secrets",
  "serde_json",
+ "skrifa",
  "tokio",
  "tool-core",
  "tool-filesystem",

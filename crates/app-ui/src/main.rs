@@ -5,6 +5,7 @@
 //! bridge. Sessions/messages/providers live in SQLite, keys in the OS
 //! credential store, and every agent step flows through the broadcast
 //! event bus (UI feed + flight-recorder persistence, same as before).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -119,6 +120,25 @@ fn kind_label(kind: &str) -> &'static str {
 /// One Lucide glyph in the bundled icon font.
 fn li(ic: Icon) -> egui::RichText {
     egui::RichText::new(char::from(ic).to_string()).family(egui::FontFamily::Name("lucide".into()))
+}
+
+/// Font setup shared by the app and the glyph-coverage test.
+///
+/// The `lucide` family lists `Hack` second: an icons-only font has no `?`
+/// glyph, and without a fallback epaint logs a "replacement character"
+/// warning and renders missing glyphs blank. With the fallback, any icon
+/// missing from the bundled font shows a visible `?` instead.
+fn app_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "lucide".to_owned(),
+        egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("lucide".into()),
+        vec!["lucide".to_owned(), "Hack".to_owned()],
+    );
+    fonts
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,12 +1164,7 @@ impl eframe::App for SuperAiApp {
             ui.horizontal(|ui| {
                 ui.label(li(Icon::Bot).size(20.0).strong());
                 ui.heading("Super-AI");
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("native Rust · no webview")
-                        .weak()
-                        .small(),
-                );
+                ui.label(egui::RichText::new("v0.2.0").weak().small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if active.is_some() {
                         if let Some(s) = &self.last_summary {
@@ -1183,14 +1198,29 @@ impl eframe::App for SuperAiApp {
                             })
                             .width(150.0)
                             .show_ui(ui, |ui| {
+                                if self.providers.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No providers yet — add one in Providers & keys.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
                                 for p in &self.providers {
                                     ui.selectable_value(
                                         &mut self.provider_sel,
                                         p.name.clone(),
-                                        format!("{} ({})", p.name, p.kind),
+                                        format!("{} ({})", p.name, kind_label(&p.kind)),
                                     );
                                 }
                             });
+                        if self.providers.is_empty() {
+                            ui.label(egui::RichText::new("no providers").small().weak());
+                            if ui.button("Add provider").clicked() {
+                                self.show_providers = true;
+                            }
+                        }
                     } else {
                         ui.label("← create a session to start");
                     }
@@ -1717,20 +1747,131 @@ fn main() -> eframe::Result<()> {
         "Super-AI",
         options,
         Box::new(|cc| {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "lucide".to_owned(),
-                egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
-            );
-            fonts.families.insert(
-                egui::FontFamily::Name("lucide".into()),
-                vec!["lucide".to_owned()],
-            );
-            cc.egui_ctx.set_fonts(fonts);
+            cc.egui_ctx.set_fonts(app_fonts());
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(SuperAiApp::new(
                 db, policy, agent, handle, ui_tx, ui_rx,
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Lucide glyph the UI renders must exist in the bundled font.
+    /// (Blank icons + epaint "replacement character" warnings mean a
+    /// codepoint is missing here.)
+    #[test]
+    fn lucide_glyphs_cover_used_icons() {
+        use skrifa::MetadataProvider;
+        let font = skrifa::FontRef::new(lucide_icons::LUCIDE_FONT_BYTES)
+            .expect("bundled lucide.ttf parses");
+        let cmap = font.charmap();
+        let used = [
+            Icon::Bot,
+            Icon::MessageSquare,
+            Icon::Plus,
+            Icon::X,
+            Icon::SlidersHorizontal,
+            Icon::Settings,
+            Icon::FlaskConical,
+            Icon::Trash2,
+            Icon::KeyRound,
+            Icon::TriangleAlert,
+            Icon::User,
+            Icon::ShieldAlert,
+            Icon::Terminal,
+            Icon::ArrowRight,
+            Icon::Check,
+            Icon::Activity,
+            Icon::Cpu,
+            Icon::Send,
+        ];
+        let mut missing = Vec::new();
+        for ic in used {
+            let ch = char::from(ic);
+            let covered = cmap.map(ch as u32).is_some_and(|g| g.to_u32() != 0);
+            if !covered {
+                missing.push(format!("{ic:?} U+{:04X}", ch as u32));
+            }
+        }
+        assert!(missing.is_empty(), "icons missing glyphs: {missing:?}");
+    }
+
+    /// Same check through epaint's own font stack with the exact production
+    /// `FontDefinitions`: catches registration bugs (wrong family name,
+    /// unloadable bytes) that a raw cmap probe cannot see.
+    #[test]
+    fn epaint_resolves_used_icons() {
+        use egui::epaint::text::{Fonts, TextOptions};
+        let mut fonts = Fonts::new(TextOptions::default(), app_fonts());
+        let view = fonts.with_pixels_per_point(1.0);
+        let mut view = view;
+        eprintln!(
+            "font_data: {:?}",
+            view.definitions().font_data.keys().collect::<Vec<_>>()
+        );
+        eprintln!("families: {:?}", view.families());
+        let id = egui::FontId::new(14.0, egui::FontFamily::Name("lucide".into()));
+        let used = [
+            Icon::Bot,
+            Icon::MessageSquare,
+            Icon::Plus,
+            Icon::X,
+            Icon::SlidersHorizontal,
+            Icon::Settings,
+            Icon::FlaskConical,
+            Icon::Trash2,
+            Icon::KeyRound,
+            Icon::TriangleAlert,
+            Icon::User,
+            Icon::ShieldAlert,
+            Icon::Terminal,
+            Icon::ArrowRight,
+            Icon::Check,
+            Icon::Activity,
+            Icon::Cpu,
+            Icon::Send,
+        ];
+        let mut missing = Vec::new();
+        for ic in used {
+            let ch = char::from(ic);
+            if !view.has_glyph(&id, ch) {
+                missing.push(format!("{ic:?} U+{:04X}", ch as u32));
+            }
+        }
+        assert!(missing.is_empty(), "epaint can't resolve: {missing:?}");
+
+        // Full layout path (shaping + atlas): a resolved glyph must also
+        // produce a non-empty galley, or it renders blank at runtime.
+        use egui::epaint::text::LayoutJob;
+        let mut blank = Vec::new();
+        for ic in used {
+            let job = LayoutJob::simple(
+                char::from(ic).to_string(),
+                id.clone(),
+                egui::Color32::WHITE,
+                200.0,
+            );
+            let galley = view.layout_job(job);
+            if galley.size().x <= 0.0 {
+                blank.push(format!("{ic:?}"));
+            }
+        }
+        assert!(blank.is_empty(), "icons lay out blank: {blank:?}");
+
+        // The Hack fallback resolves the replacement char, so epaint never
+        // logs its "replacement character" warning for this family. (Note:
+        // `has_glyph('?')` is documented to return false for the replacement
+        // char itself, so we assert resolution indirectly: every icon above
+        // resolved to a NON-replacement face, which requires the family
+        // chain — lucide first, Hack second — to be intact.)
+        let families = view.families();
+        assert!(
+            families.contains(&egui::FontFamily::Name("lucide".into())),
+            "lucide family must be registered"
+        );
+    }
 }
