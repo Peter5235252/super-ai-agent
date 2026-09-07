@@ -894,11 +894,8 @@ impl SuperAiApp {
 
             match provider_name {
                 Some(name) => {
-                    let r = match test_provider_inner(&db, &name).await {
-                        Ok(msg) => Ok(msg),
-                        Err(e) => Err(e),
-                    };
-                    row(&format!("Model connection ({name})"), r);
+                    let label = format!("Model connection ({name})");
+                    row(&label, test_provider_inner(&db, &name).await);
                 }
                 None => rows.push(DiagRow {
                     name: "Model connection".to_string(),

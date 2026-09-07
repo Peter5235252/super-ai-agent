@@ -5,6 +5,9 @@
 # Release copy of the native binary (built via cargo build --release -p app-ui)
 /Super-AI.exe
 
+# CI artifact staging (never commit test binaries)
+/_ci-artifact/
+
 # Local
 *.log
 .DS_Store
