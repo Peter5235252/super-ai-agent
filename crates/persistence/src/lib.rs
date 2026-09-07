@@ -110,10 +110,10 @@ impl Db {
     }
 
     async fn migrate(&self) -> Result<()> {
-        let migrator =
-            sqlx::migrate::Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
-                .await?;
-        migrator.run(&self.pool).await?;
+        // Embedded at compile time: the shipped exe must not depend on the
+        // source tree existing (CARGO_MANIFEST_DIR only exists where it was
+        // built, so runtime path resolution panics anywhere else).
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
 
