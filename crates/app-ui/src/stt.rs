@@ -121,12 +121,16 @@ pub fn start_recording() -> Result<Recorder, String> {
     let device = host.default_input_device().ok_or_else(|| {
         "No microphone found. Plug one in, then check Windows Settings → Sound → Input.".to_string()
     })?;
-    let device_name = device.name().unwrap_or_else(|_| "microphone".to_string());
+    let desc = device
+        .description()
+        .map_err(|e| format!("Can't inspect the microphone: {e}"))?;
+    let device_name = desc.name().to_string();
     let config = device
         .default_input_config()
         .map_err(|e| format!("Can't open {device_name}: {e}"))?;
     let channels = config.channels();
-    let sample_rate = config.sample_rate().0;
+    let sample_rate = config.sample_rate();
+    let sample_format = config.sample_format();
     let samples = Arc::new(Mutex::new(Vec::with_capacity(
         sample_rate as usize * channels as usize * 10,
     )));
@@ -138,15 +142,15 @@ pub fn start_recording() -> Result<Recorder, String> {
             .extend_from_slice(data);
     };
     let err_fn = |err| tracing::warn!("microphone stream error: {err}");
-    let stream = match config.sample_format() {
+    let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
+            config.into(),
             move |data: &[f32], _| push(data),
             err_fn,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
+            config.into(),
             move |data: &[i16], _| {
                 push(
                     &data
@@ -159,7 +163,7 @@ pub fn start_recording() -> Result<Recorder, String> {
             None,
         ),
         cpal::SampleFormat::U16 => device.build_input_stream(
-            &config.into(),
+            config.into(),
             move |data: &[u16], _| {
                 push(
                     &data
@@ -241,12 +245,9 @@ pub fn transcribe(model_path: &Path, pcm16k: &[f32]) -> Result<String, String> {
         .full(params, &pcm)
         .map_err(|e| format!("Transcription failed: {e}"))?;
     let mut out = String::new();
-    let segments = state
-        .full_n_segments()
-        .map_err(|e| format!("Transcription failed: {e}"))?;
-    for i in 0..segments {
-        let text = state
-            .full_get_segment_text(i)
+    for seg in state.as_iter() {
+        let text = seg
+            .to_str_lossy()
             .map_err(|e| format!("Transcription failed: {e}"))?;
         if !out.is_empty() && !text.starts_with(char::is_whitespace) {
             out.push(' ');
