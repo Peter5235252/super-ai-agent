@@ -3,7 +3,6 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, onAgentEvent } from "./api";
 import type {
-  AgentEvent,
   ApprovalCard,
   DiagRow,
   ModelInfo,
