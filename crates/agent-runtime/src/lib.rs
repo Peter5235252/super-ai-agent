@@ -200,25 +200,71 @@ impl ToolRegistry {
 pub struct Agent {
     pub policy: Arc<PolicyEngine>,
     pub events: broadcast::Sender<AgentEvent>,
+    live: std::sync::Mutex<Vec<tokio::task::JoinHandle<TaskSummary>>>,
 }
 
 const STREAM_RETRIES: u32 = 2;
 const RETRY_BASE_DELAY_MS: u64 = 400;
+/// Hard cap per model turn: a stalled provider must fail loudly instead of
+/// spinning the UI forever. Active streams never idle this long.
+const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Agent {
     pub fn new(policy: Arc<PolicyEngine>, events: broadcast::Sender<AgentEvent>) -> Arc<Self> {
-        Arc::new(Self { policy, events })
+        Arc::new(Self {
+            policy,
+            events,
+            live: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     fn emit(&self, ev: AgentEvent) {
         let _ = self.events.send(ev);
     }
 
-    /// Spawn a task on the tokio runtime. The returned handle resolves to
-    /// the task summary when the loop finishes.
-    pub fn spawn(self: &Arc<Self>, req: TaskRequest) -> tokio::task::JoinHandle<TaskSummary> {
+    /// Spawn a task. Handles are tracked internally so [`Agent::abort_all`]
+    /// can stop everything dead; a supervisor turns panics into
+    /// `TaskFailed` (cancellations stay silent — that's the stop button).
+    pub fn spawn(self: &Arc<Self>, req: TaskRequest) {
+        self.prune_finished();
+        let session_id = req.session_id;
         let this = Arc::clone(self);
-        tokio::spawn(async move { this.run(req).await })
+        let inner = tokio::spawn(async move { this.run(req).await });
+        let watcher = Arc::clone(self);
+        let supervised = tokio::spawn(async move {
+            match inner.await {
+                Ok(_) => {}
+                Err(e) if e.is_panic() => {
+                    let _ = watcher.events.send(AgentEvent::TaskFailed {
+                        task_id: Uuid::new_v4(),
+                        session_id,
+                        error: "the agent task crashed unexpectedly; please retry".to_string(),
+                    });
+                }
+                Err(_) => {}
+            }
+            watcher.prune_finished();
+        });
+        self.live
+            .lock()
+            .expect("agent task registry")
+            .push(supervised);
+    }
+
+    /// Abort every tracked task immediately. Pending approval gates are
+    /// cleared separately via [`PolicyEngine::abort_pending`].
+    pub fn abort_all(&self) {
+        let mut live = self.live.lock().expect("agent task registry");
+        for handle in live.iter() {
+            handle.abort();
+        }
+        live.clear();
+    }
+
+    fn prune_finished(&self) {
+        if let Ok(mut live) = self.live.lock() {
+            live.retain(|h| !h.is_finished());
+        }
     }
 
     async fn run(self: Arc<Self>, req: TaskRequest) -> TaskSummary {
@@ -265,22 +311,29 @@ impl Agent {
                 reasoning_effort: req.reasoning_effort,
             };
 
-            // Stream the model's response, with bounded retry on failure.
-            let (text, reasoning, pending, usage) =
-                match self.stream_turn(&req, task_id, &request).await {
-                    Ok(parts) => parts,
-                    Err(error) => {
-                        summary.status = TaskStatus::Failed;
-                        summary.final_text = last_assistant_text(&messages);
-                        self.emit(AgentEvent::TaskFailed {
-                            task_id,
-                            session_id,
-                            error: error.clone(),
-                        });
-                        warn!(%task_id, %error, "task failed");
-                        return summary;
-                    }
-                };
+            // Stream the model's response, with bounded retry on failure
+            // and a hard per-turn timeout: a stalled provider must fail
+            // loudly instead of spinning the UI forever.
+            let turn =
+                tokio::time::timeout(TURN_TIMEOUT, self.stream_turn(&req, task_id, &request)).await;
+            let turned: Result<_, String> = match turn {
+                Ok(inner) => inner,
+                Err(_) => Err("model response timed out after 10 minutes".to_string()),
+            };
+            let (text, reasoning, pending, usage) = match turned {
+                Ok(parts) => parts,
+                Err(error) => {
+                    summary.status = TaskStatus::Failed;
+                    summary.final_text = last_assistant_text(&messages);
+                    self.emit(AgentEvent::TaskFailed {
+                        task_id,
+                        session_id,
+                        error: error.clone(),
+                    });
+                    warn!(%task_id, %error, "task failed");
+                    return summary;
+                }
+            };
 
             summary.final_text = text.clone();
             summary.input_tokens += usage.input_tokens;

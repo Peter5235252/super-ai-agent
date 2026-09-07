@@ -146,6 +146,12 @@ impl PolicyEngine {
     pub async fn pending_count(&self) -> usize {
         self.pending.lock().await.len()
     }
+
+    /// Drop every outstanding approval request (stop button). In-flight
+    /// tasks aborted elsewhere will see their receivers fail.
+    pub async fn abort_pending(&self) {
+        self.pending.lock().await.clear();
+    }
 }
 
 /// A tool is read-only when every declared side effect is a file read
@@ -272,6 +278,26 @@ mod tests {
             Decision::Allow
         ));
         assert_eq!(p.mode().await, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn abort_pending_clears_gates() {
+        let p = PolicyEngine::new(RiskClass::Low);
+        let d = ToolDefinition::new(
+            "fs.write",
+            "w",
+            Value::Null,
+            RiskClass::Medium,
+            vec![SideEffect::WritesFiles],
+        );
+        let id = match p.authorize(&d, &Value::Null, &ToolContext::default()).await {
+            Decision::PendingApproval { id, .. } => id,
+            other => panic!("expected pending approval, got {other:?}"),
+        };
+        assert_eq!(p.pending_count().await, 1);
+        p.abort_pending().await;
+        assert_eq!(p.pending_count().await, 0);
+        assert!(!p.respond(id, ApprovalDecision::AllowOnce).await);
     }
 
     #[tokio::test]
