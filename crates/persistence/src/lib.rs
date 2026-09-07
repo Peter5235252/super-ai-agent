@@ -1,5 +1,8 @@
 //! SQLite persistence for sessions, messages, events, providers and
-//! settings. Migrations are versioned from day one. Raw credentials are
+//! settings. Schema is ensured with idempotent DDL (no version tracking,
+//! no migration files): every column of every release is created if absent,
+//! so line endings, build paths and checksum algorithms can never break a
+//! shipped binary the way file-based migrations did. Raw credentials are
 //! never stored here — see the `secrets` crate.
 #![forbid(unsafe_code)]
 
@@ -17,8 +20,6 @@ use uuid::Uuid;
 pub enum DbError {
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("migration error: {0}")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("bad uuid '{0}': {1}")]
     BadUuid(String, #[source] uuid::Error),
 }
@@ -110,10 +111,79 @@ impl Db {
     }
 
     async fn migrate(&self) -> Result<()> {
-        // Embedded at compile time: the shipped exe must not depend on the
-        // source tree existing (CARGO_MANIFEST_DIR only exists where it was
-        // built, so runtime path resolution panics anywhere else).
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        // Base schema: every table and index, including all columns ever
+        // added. `IF NOT EXISTS` makes this a safe no-op on existing DBs.
+        const BASE: &[&str] = &[
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id            TEXT PRIMARY KEY NOT NULL,
+                title         TEXT NOT NULL DEFAULT 'New session',
+                workspace     TEXT,
+                provider_name TEXT,
+                model         TEXT,
+                status        TEXT NOT NULL DEFAULT 'idle',
+                reasoning_effort TEXT,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS messages (
+                id           TEXT PRIMARY KEY NOT NULL,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                tool_calls   TEXT,
+                tool_call_id TEXT,
+                reasoning    TEXT,
+                created_at   INTEGER NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)",
+            "CREATE TABLE IF NOT EXISTS events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    TEXT,
+                session_id TEXT,
+                kind       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at)",
+            "CREATE TABLE IF NOT EXISTS providers (
+                name          TEXT PRIMARY KEY NOT NULL,
+                kind          TEXT NOT NULL,
+                base_url      TEXT,
+                default_model TEXT,
+                is_default    INTEGER NOT NULL DEFAULT 0,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            )",
+        ];
+        for stmt in BASE {
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
+        // Later additions: add the column when an older DB lacks it.
+        // (table/column names are compile-time constants, never user input)
+        for (table, column, ddl) in [
+            (
+                "messages",
+                "reasoning",
+                "ALTER TABLE messages ADD COLUMN reasoning TEXT",
+            ),
+            (
+                "sessions",
+                "reasoning_effort",
+                "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT",
+            ),
+        ] {
+            let cols: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .fetch_all(&self.pool)
+                    .await?;
+            if !cols.iter().any(|c| c == column) {
+                sqlx::query(ddl).execute(&self.pool).await?;
+            }
+        }
         Ok(())
     }
 

@@ -32,7 +32,7 @@
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
-│ persistence (sqlx/SQLite, versioned migrations)      │
+│ persistence (sqlx/SQLite, idempotent schema)      │
 │ secrets (Windows Credential Manager via keyring)     │
 └──────────────────────────────────────────────────────┘
 ```

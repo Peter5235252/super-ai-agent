@@ -1,0 +1,13 @@
+# Deterministic checkouts: code and SQL always travel as LF so hashes,
+// embeds and diffs never depend on who checked out where.
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
