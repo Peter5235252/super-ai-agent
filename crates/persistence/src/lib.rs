@@ -182,11 +182,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_session_effort(
-        &self,
-        session: SessionId,
-        effort: Option<&str>,
-    ) -> Result<()> {
+    pub async fn set_session_effort(&self, session: SessionId, effort: Option<&str>) -> Result<()> {
         sqlx::query("UPDATE sessions SET reasoning_effort = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(effort)
             .bind(now_ms())
@@ -427,10 +423,7 @@ mod tests {
         let assistant = &messages[1];
         assert_eq!(assistant.role, "assistant");
         assert!(assistant.tool_calls.as_deref().unwrap().contains("fs.list"));
-        assert_eq!(
-            assistant.reasoning.as_deref(),
-            Some("need file list first")
-        );
+        assert_eq!(assistant.reasoning.as_deref(), Some("need file list first"));
         let tool = &messages[2];
         assert_eq!(tool.role, "tool");
         assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));

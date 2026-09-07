@@ -279,7 +279,8 @@ fn compat_effort(effort: provider_api::ReasoningEffort) -> Option<&'static str> 
     }
 }
 
-fn build_messages(messages: &[Message], system: Option<&str>) -> Vec<Value> {    let mut items = Vec::new();
+fn build_messages(messages: &[Message], system: Option<&str>) -> Vec<Value> {
+    let mut items = Vec::new();
     if let Some(system) = system.filter(|s| !s.is_empty()) {
         items.push(json!({"role": "system", "content": system}));
     }
@@ -752,14 +753,18 @@ mod tests {
         assert_eq!(compat_effort(ReasoningEffort::Max), Some("max"));
     }
 
-    fn chunk_with_text(t: &str) -> String {        serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": null}]})
+    fn chunk_with_text(t: &str) -> String {
+        serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": null}]})
             .to_string()
     }
 
     #[test]
     fn think_tags_split_reasoning_from_answer() {
         let mut acc = StreamAcc::default();
-        let out = map_chat_chunk(&mut acc, &chunk_with_text("<think>hmm, let me see</think>The answer."));
+        let out = map_chat_chunk(
+            &mut acc,
+            &chunk_with_text("<think>hmm, let me see</think>The answer."),
+        );
         assert_eq!(out.len(), 2);
         assert!(matches!(
             &out[0],

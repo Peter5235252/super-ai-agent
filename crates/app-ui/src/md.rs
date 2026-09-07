@@ -44,9 +44,19 @@ pub enum CellAlign {
 
 #[derive(Debug, Clone)]
 pub enum Block {
-    Heading { level: u8, spans: Vec<Span> },
-    Para { spans: Vec<Span>, indent: usize, quote: bool },
-    Code { lang: String, code: String },
+    Heading {
+        level: u8,
+        spans: Vec<Span>,
+    },
+    Para {
+        spans: Vec<Span>,
+        indent: usize,
+        quote: bool,
+    },
+    Code {
+        lang: String,
+        code: String,
+    },
     ListItem {
         ordered: bool,
         index: u64,
@@ -511,103 +521,97 @@ pub fn show(ui: &mut egui::Ui, salt: &str, text: &str) {
     ui.push_id(salt, |ui| {
         let mut table_seq = 0usize;
         for block in parse(text) {
-        match block {
-            Block::Heading { level, spans } => {
-                ui.add_space(4.0);
-                let mut job = span_job(&spans, level_size(level));
-                for section in job.sections.iter_mut() {
-                    section.format.font_id.size = level_size(level);
-                    section.format.color = egui::Color32::WHITE;
+            match block {
+                Block::Heading { level, spans } => {
+                    ui.add_space(4.0);
+                    let mut job = span_job(&spans, level_size(level));
+                    for section in job.sections.iter_mut() {
+                        section.format.font_id.size = level_size(level);
+                        section.format.color = egui::Color32::WHITE;
+                    }
+                    ui.label(job);
                 }
-                ui.label(job);
-            }
-            Block::Para {
-                spans,
-                indent,
-                quote,
-            } => {
-                let job = span_job(&spans, 14.0);
-                if indent > 0 || quote {
-                    ui.horizontal(|ui| {
-                        ui.add_space((indent as f32) * 8.0);
-                        if quote {
-                            ui.label(
-                                egui::RichText::new("│").weak().small(),
-                            );
+                Block::Para {
+                    spans,
+                    indent,
+                    quote,
+                } => {
+                    let job = span_job(&spans, 14.0);
+                    if indent > 0 || quote {
+                        ui.horizontal(|ui| {
+                            ui.add_space((indent as f32) * 8.0);
+                            if quote {
+                                ui.label(egui::RichText::new("│").weak().small());
+                            }
+                            ui.label(job);
+                        });
+                    } else {
+                        ui.label(job);
+                    }
+                }
+                Block::Code { lang, code } => {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        if !lang.is_empty() {
+                            ui.label(egui::RichText::new(&lang).small().weak().monospace());
                         }
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(code).monospace())
+                                .selectable(true),
+                        );
+                    });
+                }
+                Block::ListItem {
+                    ordered,
+                    index,
+                    checked,
+                    spans,
+                    indent,
+                    ..
+                } => {
+                    let marker = match checked {
+                        Some(true) => "[x] ".to_string(),
+                        Some(false) => "[ ] ".to_string(),
+                        None if ordered => format!("{index}. "),
+                        None => "• ".to_string(),
+                    };
+                    let job = span_job(&spans, 14.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((indent as f32) * 18.0);
+                        ui.label(egui::RichText::new(marker).weak());
                         ui.label(job);
                     });
-                } else {
-                    ui.label(job);
                 }
-            }
-            Block::Code { lang, code } => {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    if !lang.is_empty() {
-                        ui.label(egui::RichText::new(&lang).small().weak().monospace());
-                    }
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(code).monospace()).selectable(true),
-                    );
-                });
-            }
-            Block::ListItem {
-                ordered,
-                index,
-                checked,
-                spans,
-                indent,
-                ..
-            } => {
-                let marker = match checked {
-                    Some(true) => "[x] ".to_string(),
-                    Some(false) => "[ ] ".to_string(),
-                    None if ordered => format!("{index}. "),
-                    None => "• ".to_string(),
-                };
-                let job = span_job(&spans, 14.0);
-                ui.horizontal(|ui| {
-                    ui.add_space((indent as f32) * 18.0);
-                    ui.label(egui::RichText::new(marker).weak());
-                    ui.label(job);
-                });
-            }
-            Block::Table {
-                headers,
-                aligns,
-                rows,
-            } => {
-                table_seq += 1;
-                egui::Grid::new(format!("md-table-{table_seq}"))
-                    .striped(true)
-                    .spacing([14.0, 4.0])
-                    .show(ui, |ui| {
-                        for (i, head) in headers.iter().enumerate() {
-                            cell(ui, &span_job(head, 13.5), aligns.get(i), true);
-                        }
-                        ui.end_row();
-                        for row in &rows {
-                            for (i, cell_spans) in row.iter().enumerate() {
-                                cell(ui, &span_job(cell_spans, 13.5), aligns.get(i), false);
+                Block::Table {
+                    headers,
+                    aligns,
+                    rows,
+                } => {
+                    table_seq += 1;
+                    egui::Grid::new(format!("md-table-{table_seq}"))
+                        .striped(true)
+                        .spacing([14.0, 4.0])
+                        .show(ui, |ui| {
+                            for (i, head) in headers.iter().enumerate() {
+                                cell(ui, &span_job(head, 13.5), aligns.get(i), true);
                             }
                             ui.end_row();
-                        }
-                    });
+                            for row in &rows {
+                                for (i, cell_spans) in row.iter().enumerate() {
+                                    cell(ui, &span_job(cell_spans, 13.5), aligns.get(i), false);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                }
+                Block::Rule => {
+                    ui.separator();
+                }
             }
-            Block::Rule => {
-                ui.separator();
-            }
-        }
         }
     });
 }
 
-fn cell(
-    ui: &mut egui::Ui,
-    job: &egui::text::LayoutJob,
-    align: Option<&CellAlign>,
-    header: bool,
-) {
+fn cell(ui: &mut egui::Ui, job: &egui::text::LayoutJob, align: Option<&CellAlign>, header: bool) {
     let mut job = job.clone();
     if header {
         for section in job.sections.iter_mut() {
@@ -621,10 +625,9 @@ fn cell(
             });
         }
         Some(CellAlign::Center) => {
-            ui.with_layout(
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| ui.label(job),
-            );
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(job)
+            });
         }
         _ => {
             ui.label(job);

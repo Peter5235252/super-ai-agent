@@ -228,7 +228,8 @@ fn reasoning_body(
     Some(json!({ "effort": level }))
 }
 
-fn build_input(messages: &[Message]) -> Vec<Value> {    let mut items = Vec::new();
+fn build_input(messages: &[Message]) -> Vec<Value> {
+    let mut items = Vec::new();
     for m in messages {
         match m.role {
             MessageRole::System => items.push(json!({"role": "system", "content": m.content})),
@@ -401,7 +402,10 @@ mod tests {
     fn reasoning_body_maps_per_kind() {
         use provider_api::{ProviderKind, ReasoningEffort};
         assert_eq!(reasoning_body(ProviderKind::OpenAI, None), None);
-        assert_eq!(reasoning_body(ProviderKind::OpenAI, Some(ReasoningEffort::Off)), None);
+        assert_eq!(
+            reasoning_body(ProviderKind::OpenAI, Some(ReasoningEffort::Off)),
+            None
+        );
         assert_eq!(
             reasoning_body(ProviderKind::OpenAI, Some(ReasoningEffort::Max)),
             Some(json!({ "effort": "max" }))

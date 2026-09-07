@@ -64,6 +64,51 @@ impl ApprovalDecision {
     }
 }
 
+/// Agent operating mode (mirrors the industry Plan/Act pattern).
+///
+/// - `Plan`: read-only. The agent may inspect (list/read files) and explain,
+///   but writes and commands are refused by policy.
+/// - `Build`: full tools; writes and commands still need human approval
+///   unless auto-approved by risk threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    Plan,
+    #[default]
+    Build,
+}
+
+impl AgentMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentMode::Plan => "Plan",
+            AgentMode::Build => "Build",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "plan" => Some(AgentMode::Plan),
+            "build" => Some(AgentMode::Build),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentMode::Plan => "plan",
+            AgentMode::Build => "build",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            AgentMode::Plan => AgentMode::Build,
+            AgentMode::Build => AgentMode::Plan,
+        }
+    }
+}
+
 /// Declared side effects of a tool, shown to the user before approval and
 /// stored in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

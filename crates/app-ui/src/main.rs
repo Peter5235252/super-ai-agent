@@ -15,12 +15,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use agent_runtime::{Agent, AgentEvent, TaskRequest, TaskSummary, ToolRegistry};
-use app_core::{ApprovalDecision, RiskClass, WorkspaceConfig, now_ms};
+use app_core::{AgentMode, ApprovalDecision, RiskClass, WorkspaceConfig, now_ms};
 use futures::StreamExt;
 use lucide_icons::Icon;
-use provider_api::ReasoningEffort;
 use persistence::{Db, MessageRow, ProviderRow, SessionRow};
 use policy_engine::PolicyEngine;
+use provider_api::ReasoningEffort;
 use provider_api::{Message, MessageRole, ModelInfo, ModelProvider};
 use secrecy::SecretString;
 use tokio::sync::broadcast;
@@ -128,7 +128,9 @@ fn kind_blurb(kind: &str) -> &'static str {
         "xai" => "Grok models by SpaceXAI. Needs an xAI API key.",
         "mistral" => "Mistral + Codestral. Needs a La Plateforme API key.",
         "gemini" => "Google Gemini. Needs a Google AI Studio key.",
-        "ollama" => "Free models on your own PC via Ollama. No key — install Ollama and pull a model first.",
+        "ollama" => {
+            "Free models on your own PC via Ollama. No key — install Ollama and pull a model first."
+        }
         "local" => "LM Studio, vLLM or llama.cpp server. No key — enter its address below.",
         _ => "",
     }
@@ -246,6 +248,8 @@ struct SuperAiApp {
     autonomy: RiskClass,
     /// Per-session reasoning effort override (None = provider default).
     effort_sel: Option<ReasoningEffort>,
+    /// Mirrors the policy engine's operating mode (Plan/Build).
+    mode_mirror: AgentMode,
 
     show_providers: bool,
     new_workspace: String,
@@ -276,6 +280,7 @@ impl SuperAiApp {
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<UiUpdate>,
         rx: mpsc::Receiver<UiUpdate>,
+        mode: AgentMode,
     ) -> Self {
         let app = Self {
             db,
@@ -301,6 +306,7 @@ impl SuperAiApp {
             last_summary: None,
             autonomy: RiskClass::Low,
             effort_sel: None,
+            mode_mirror: mode,
             show_providers: false,
             new_workspace: String::new(),
             draft: String::new(),
@@ -408,7 +414,10 @@ impl SuperAiApp {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
             self.provider_sel = s.provider_name.clone().unwrap_or_default();
             self.model_sel = s.model.clone().unwrap_or_default();
-            self.effort_sel = s.reasoning_effort.as_deref().and_then(ReasoningEffort::parse);
+            self.effort_sel = s
+                .reasoning_effort
+                .as_deref()
+                .and_then(ReasoningEffort::parse);
         }
         self.load_messages(id);
     }
@@ -429,7 +438,10 @@ impl SuperAiApp {
             } else {
                 ws
             };
-            match db.create_session(id, "New session", Some(ws_path.as_str())).await {
+            match db
+                .create_session(id, "New session", Some(ws_path.as_str()))
+                .await
+            {
                 Ok(row) => {
                     let _ = tx.send(UiUpdate::SessionCreated(row));
                 }
@@ -461,6 +473,27 @@ impl SuperAiApp {
         self.spawn(async move {
             policy.set_auto_approve(risk).await;
         });
+    }
+
+    fn set_mode(&mut self, mode: AgentMode) {
+        self.mode_mirror = mode;
+        let policy = self.policy.clone();
+        let db = self.db.clone();
+        self.spawn(async move {
+            policy.set_mode(mode).await;
+            let _ = db.set_setting("agent_mode", mode.as_str()).await;
+        });
+        self.notice = Some(if mode == AgentMode::Build {
+            "Build mode — the agent can act (writes and commands still need your approval)."
+                .to_string()
+        } else {
+            "Plan mode — read-only: the agent can look and explain, not change anything."
+                .to_string()
+        });
+    }
+
+    fn toggle_mode(&mut self) {
+        self.set_mode(self.mode_mirror.toggle());
     }
 
     // -- chat -------------------------------------------------------------
@@ -672,7 +705,10 @@ impl SuperAiApp {
             self.browser_provider = if !self.provider_sel.is_empty() {
                 self.provider_sel.clone()
             } else {
-                self.providers.first().map(|p| p.name.clone()).unwrap_or_default()
+                self.providers
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default()
             };
         }
         self.show_models = true;
@@ -1202,6 +1238,22 @@ async fn send_message_inner(
         .map_err(|e| format!("{e}"))?;
 
     let mut system = SYSTEM_PROMPT.to_string();
+    // The operating mode changes what the model may even attempt: in Plan
+    // mode the policy refuses writes/commands, so the prompt must steer
+    // toward investigating and explaining instead.
+    if agent.policy.mode().await == AgentMode::Build {
+        system.push_str(
+            "\n\nCurrent mode: BUILD — use any tool you need. File writes and terminal \
+             commands need human approval and may be denied; if so, report it and adapt.",
+        );
+    } else {
+        system.push_str(
+            "\n\nCurrent mode: PLAN (read-only) — ONLY use fs.list and fs.read to investigate, \
+             then explain your plan step by step. Do NOT call fs.write or process.run: they \
+             are blocked in this mode. End by asking the user to switch to Build mode (Tab \
+             key) if they want you to implement it.",
+        );
+    }
     if let Some(root) = workspace.as_ref().and_then(|ws| ws.root()) {
         system.push_str(&format!(
             "\n\nYour workspace folder is: {}\nList, read and write files there, and run terminal commands from there.",
@@ -1624,9 +1676,7 @@ impl eframe::App for SuperAiApp {
                     ui.add_enabled_ui(self.active_id.is_some(), |ui| {
                         let before = self.effort_sel;
                         egui::ComboBox::from_id_salt("effort")
-                            .selected_text(
-                                self.effort_sel.map(|e| e.label()).unwrap_or("Default"),
-                            )
+                            .selected_text(self.effort_sel.map(|e| e.label()).unwrap_or("Default"))
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.effort_sel, None, "Default");
                                 for e in [
@@ -1645,8 +1695,7 @@ impl eframe::App for SuperAiApp {
                                 let db = self.db.clone();
                                 let s = effort.map(|e| e.as_str().to_string());
                                 self.spawn(async move {
-                                    let _ =
-                                        db.set_session_effort(id, s.as_deref()).await;
+                                    let _ = db.set_session_effort(id, s.as_deref()).await;
                                 });
                             }
                         }
@@ -1669,12 +1718,53 @@ impl eframe::App for SuperAiApp {
                 });
             });
 
-        // -- bottom: composer -------------------------------------------------
+        // -- bottom: mode strip + composer --------------------------------------
         egui::Panel::bottom("composer").show(ui, |ui| {
             ui.add_space(4.0);
             if let Some(n) = self.notice.clone() {
                 ui.label(egui::RichText::new(n).small().weak());
             }
+            // Operating mode: blue Build acts (with approvals), yellow Plan
+            // only reads. Clickable pills + Tab toggle in the composer.
+            let mut toggle = false;
+            ui.horizontal(|ui| {
+                let build_on = self.mode_mirror == AgentMode::Build;
+                if ui
+                    .add(egui::Button::selectable(
+                        build_on,
+                        egui::RichText::new("Build")
+                            .strong()
+                            .color(egui::Color32::from_rgb(96, 165, 250)),
+                    ))
+                    .on_hover_text("Build mode: the agent can act (approvals still apply)")
+                    .clicked()
+                    && !build_on
+                {
+                    toggle = true;
+                }
+                if ui
+                    .add(egui::Button::selectable(
+                        !build_on,
+                        egui::RichText::new("Plan")
+                            .strong()
+                            .color(egui::Color32::from_rgb(250, 204, 21)),
+                    ))
+                    .on_hover_text("Plan mode: read-only, the agent plans but changes nothing")
+                    .clicked()
+                    && build_on
+                {
+                    toggle = true;
+                }
+                ui.label(
+                    egui::RichText::new(if build_on {
+                        "acts with approval prompts"
+                    } else {
+                        "read-only — Tab to switch"
+                    })
+                    .small()
+                    .weak(),
+                );
+            });
             ui.horizontal(|ui| {
                 let hint = if self.streaming {
                     "Agent is working…"
@@ -1683,7 +1773,7 @@ impl eframe::App for SuperAiApp {
                     .and_then(|s| s.provider_name.as_ref())
                     .is_some()
                 {
-                    "Ask the agent something… (Enter sends, Shift+Enter newline)"
+                    "Ask the agent something… (Enter sends, Shift+Enter newline, Tab switches mode)"
                 } else {
                     "Bind a provider and model above first…"
                 };
@@ -1697,6 +1787,15 @@ impl eframe::App for SuperAiApp {
                     && ui.input_mut(|i| {
                         i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::Enter) != 0
                     });
+                // Tab toggles Plan/Build while typing (focus navigation
+                // elsewhere is untouched).
+                let tab = resp.has_focus()
+                    && ui.input_mut(|i| {
+                        i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::Tab) != 0
+                    });
+                if tab {
+                    toggle = true;
+                }
                 let can_send =
                     self.active_id.is_some() && !self.streaming && !self.draft.trim().is_empty();
                 if ui
@@ -1707,6 +1806,9 @@ impl eframe::App for SuperAiApp {
                     self.queue_send();
                 }
             });
+            if toggle {
+                self.toggle_mode();
+            }
             ui.add_space(4.0);
         });
 
@@ -1813,16 +1915,22 @@ impl eframe::App for SuperAiApp {
                         });
                     }
                     if !self.stream.is_empty() || !self.stream_reasoning.is_empty() {
+                        // Snapshot counts first: the header below borrows them
+                        // while the body streams live token-by-token.
+                        let live_chars = self.stream.chars().count()
+                            + self.stream_reasoning.chars().count();
                         ui.add_space(6.0);
                         ui.push_id("streaming", |ui| {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(li(Icon::Bot).color(egui::Color32::LIGHT_GREEN));
                                     ui.label(
-                                        egui::RichText::new("assistant · streaming")
-                                            .small()
-                                            .strong()
-                                            .color(egui::Color32::LIGHT_GREEN),
+                                        egui::RichText::new(format!(
+                                            "assistant · LIVE · {live_chars} chars"
+                                        ))
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::LIGHT_GREEN),
                                     );
                                 });
                                 if !self.stream_reasoning.is_empty() {
@@ -2004,8 +2112,9 @@ impl eframe::App for SuperAiApp {
                         if default_base_url(&self.prov_kind).is_some()
                             && ui.button("Fill default").clicked()
                         {
-                            self.prov_base =
-                                default_base_url(&self.prov_kind).unwrap_or_default().to_string();
+                            self.prov_base = default_base_url(&self.prov_kind)
+                                .unwrap_or_default()
+                                .to_string();
                         }
                     });
                     ui.horizontal(|ui| {
@@ -2157,13 +2266,9 @@ impl eframe::App for SuperAiApp {
                                         if ui.button(&m.display_name).clicked() {
                                             pick = Some(m.id.clone());
                                         }
-                                        ui.label(
-                                            egui::RichText::new(&m.id).small().monospace(),
-                                        );
+                                        ui.label(egui::RichText::new(&m.id).small().monospace());
                                     });
-                                    ui.label(
-                                        egui::RichText::new(catalog_line(&m)).small().weak(),
-                                    );
+                                    ui.label(egui::RichText::new(catalog_line(&m)).small().weak());
                                 }
                                 if !self.browser_loading && self.browser_models.is_empty() {
                                     ui.label(
@@ -2244,6 +2349,15 @@ fn main() -> eframe::Result<()> {
     let (bus_tx, _bus_rx) = broadcast::channel::<AgentEvent>(4096);
     let agent = Agent::new(policy.clone(), bus_tx.clone());
 
+    // Restore the persisted operating mode (Plan/Build).
+    let saved_mode = rt
+        .block_on(db.get_setting("agent_mode"))
+        .ok()
+        .flatten()
+        .and_then(|s| AgentMode::parse(&s))
+        .unwrap_or_default();
+    rt.block_on(policy.set_mode(saved_mode));
+
     // Single global forwarder: every agent event is persisted (flight
     // recorder) exactly once, then relayed to the UI thread.
     let (ui_tx, ui_rx) = mpsc::channel::<UiUpdate>();
@@ -2284,7 +2398,7 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.set_fonts(app_fonts());
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(SuperAiApp::new(
-                db, policy, agent, handle, ui_tx, ui_rx,
+                db, policy, agent, handle, ui_tx, ui_rx, saved_mode,
             )))
         }),
     )

@@ -92,10 +92,7 @@ impl AnthropicProvider {
         });
         // Extended thinking. The output cap must leave room for the
         // thinking budget on top of the visible answer.
-        if let Some(budget) = request
-            .reasoning_effort
-            .and_then(thinking_budget)
-        {
+        if let Some(budget) = request.reasoning_effort.and_then(thinking_budget) {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
             let floor = budget + 4096;
             let max = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(floor);
@@ -444,7 +441,9 @@ mod tests {
         assert!(start.is_empty());
         let delta = map_anth_event(
             &mut state,
-            ev(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}"#),
+            ev(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}"#,
+            ),
         );
         assert!(matches!(
             &delta[0],
@@ -453,7 +452,9 @@ mod tests {
         // Plain text deltas still map to chat text.
         let text = map_anth_event(
             &mut state,
-            ev(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#),
+            ev(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
         );
         assert!(matches!(&text[0], ProviderEvent::TextDelta { .. }));
     }

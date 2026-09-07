@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use app_core::{ApprovalDecision, RiskClass};
+use app_core::{AgentMode, ApprovalDecision, RiskClass, SideEffect};
 use serde_json::Value;
 use tokio::sync::{Mutex, oneshot};
 use tool_core::{ToolContext, ToolDefinition};
@@ -39,6 +39,7 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct PolicyEngine {
     auto_approve: Mutex<RiskClass>,
+    mode: Mutex<AgentMode>,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<ApprovalDecision>>>,
 }
 
@@ -46,6 +47,7 @@ impl PolicyEngine {
     pub fn new(auto_approve: RiskClass) -> Arc<Self> {
         Arc::new(Self {
             auto_approve: Mutex::new(auto_approve),
+            mode: Mutex::new(AgentMode::default()),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -53,6 +55,16 @@ impl PolicyEngine {
     /// Autonomy knob: operations at or below this risk run automatically.
     pub async fn set_auto_approve(&self, risk: RiskClass) {
         *self.auto_approve.lock().await = risk;
+    }
+
+    /// Operating mode. `Plan` refuses every tool with side effects beyond
+    /// reading, so the agent can only inspect and explain.
+    pub async fn set_mode(&self, mode: AgentMode) {
+        *self.mode.lock().await = mode;
+    }
+
+    pub async fn mode(&self) -> AgentMode {
+        *self.mode.lock().await
     }
 
     /// Evaluate a tool call. Never blocks; `PendingApproval` carries a
@@ -74,6 +86,17 @@ impl PolicyEngine {
         }
         if def.network && false {
             // reserved: network policy enforcement arrives with the sandbox phase
+        }
+
+        // Plan mode: anything beyond pure reads is refused up front (never
+        // even reaches the approval gate), so the agent plans instead of doing.
+        if *self.mode.lock().await == AgentMode::Plan && !is_read_only(def) {
+            return Decision::Deny {
+                reason: format!(
+                    "Plan mode is read-only: '{}' can only run in Build mode (press Tab to switch)",
+                    def.name
+                ),
+            };
         }
 
         let mut risk = def.risk;
@@ -123,6 +146,14 @@ impl PolicyEngine {
     pub async fn pending_count(&self) -> usize {
         self.pending.lock().await.len()
     }
+}
+
+/// A tool is read-only when every declared side effect is a file read
+/// (tools declaring nothing are treated as read-only too).
+fn is_read_only(def: &ToolDefinition) -> bool {
+    def.side_effects
+        .iter()
+        .all(|s| matches!(s, SideEffect::ReadsFiles))
 }
 
 #[cfg(test)]
@@ -184,6 +215,71 @@ mod tests {
                 .await,
             Decision::PendingApproval { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_reads_denies_writes_and_commands() {
+        use app_core::SideEffect::*;
+        let p = PolicyEngine::new(RiskClass::Critical);
+        p.set_mode(AgentMode::Plan).await;
+
+        let read = ToolDefinition::new(
+            "fs.read",
+            "r",
+            Value::Null,
+            RiskClass::Low,
+            vec![ReadsFiles],
+        );
+        assert!(matches!(
+            p.authorize(&read, &Value::Null, &ToolContext::default())
+                .await,
+            Decision::Allow
+        ));
+
+        let write = ToolDefinition::new(
+            "fs.write",
+            "w",
+            Value::Null,
+            RiskClass::Medium,
+            vec![WritesFiles],
+        );
+        match p
+            .authorize(&write, &Value::Null, &ToolContext::default())
+            .await
+        {
+            Decision::Deny { reason } => assert!(reason.contains("Plan mode")),
+            other => panic!("expected plan-mode deny, got {other:?}"),
+        }
+
+        let run = ToolDefinition::new(
+            "process.run",
+            "x",
+            Value::Null,
+            RiskClass::High,
+            vec![RunsCommands],
+        );
+        assert!(matches!(
+            p.authorize(&run, &Value::Null, &ToolContext::default())
+                .await,
+            Decision::Deny { .. }
+        ));
+
+        // Back to Build: the same calls flow through risk policy again.
+        p.set_mode(AgentMode::Build).await;
+        assert!(matches!(
+            p.authorize(&write, &Value::Null, &ToolContext::default())
+                .await,
+            Decision::Allow
+        ));
+        assert_eq!(p.mode().await, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn agent_mode_roundtrip() {
+        assert_eq!(AgentMode::default(), AgentMode::Build);
+        assert_eq!(AgentMode::parse("plan"), Some(AgentMode::Plan));
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.as_str(), "build");
     }
 
     #[tokio::test]

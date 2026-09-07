@@ -270,17 +270,17 @@ impl Agent {
                 match self.stream_turn(&req, task_id, &request).await {
                     Ok(parts) => parts,
                     Err(error) => {
-                    summary.status = TaskStatus::Failed;
-                    summary.final_text = last_assistant_text(&messages);
-                    self.emit(AgentEvent::TaskFailed {
-                        task_id,
-                        session_id,
-                        error: error.clone(),
-                    });
-                    warn!(%task_id, %error, "task failed");
-                    return summary;
-                }
-            };
+                        summary.status = TaskStatus::Failed;
+                        summary.final_text = last_assistant_text(&messages);
+                        self.emit(AgentEvent::TaskFailed {
+                            task_id,
+                            session_id,
+                            error: error.clone(),
+                        });
+                        warn!(%task_id, %error, "task failed");
+                        return summary;
+                    }
+                };
 
             summary.final_text = text.clone();
             summary.input_tokens += usage.input_tokens;
