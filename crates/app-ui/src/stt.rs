@@ -28,10 +28,6 @@ pub const MAX_RECORD_SECS: u64 = 120;
 /// Peak amplitude below this counts as silence.
 pub const SILENCE_PEAK: f32 = 0.01;
 
-pub fn model_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("models").join(MODEL_FILE)
-}
-
 /// Download the model on first use. Skipped when already present.
 pub async fn ensure_model(data_dir: &Path) -> Result<PathBuf, String> {
     let dir = data_dir.join("models");
@@ -102,7 +98,6 @@ pub struct Recording {
     pub samples: Vec<f32>,
     pub channels: u16,
     pub sample_rate: u32,
-    pub secs: u64,
 }
 
 /// Live capture handle. Dropping the stream stops the microphone, so
@@ -200,20 +195,12 @@ impl Recorder {
         self.started.elapsed()
     }
 
-    pub fn buffered_secs(&self) -> u64 {
-        let frames = self.samples.lock().unwrap_or_else(|e| e.into_inner()).len()
-            / self.channels.max(1) as usize;
-        let rate = self.sample_rate.max(1) as u64;
-        frames as u64 / rate
-    }
-
     pub fn finish(self) -> Recording {
         let samples = std::mem::take(&mut *self.samples.lock().unwrap_or_else(|e| e.into_inner()));
         Recording {
             samples,
             channels: self.channels,
             sample_rate: self.sample_rate,
-            secs: self.started.elapsed().as_secs(),
         }
     }
 }

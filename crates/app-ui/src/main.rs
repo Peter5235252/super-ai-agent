@@ -1997,10 +1997,10 @@ impl eframe::App for SuperAiApp {
                 self.toggle_mode();
             }
             // Recording auto-stops at the cap so a forgotten mic can't run on.
-            if let Some(rec) = &self.stt {
-                if rec.elapsed() > std::time::Duration::from_secs(stt::MAX_RECORD_SECS) {
-                    self.stop_and_transcribe();
-                }
+            if let Some(rec) = &self.stt
+                && rec.elapsed() > std::time::Duration::from_secs(stt::MAX_RECORD_SECS)
+            {
+                self.stop_and_transcribe();
             }
             // Focus the composer after opening a session.
             if self.focus_composer {
