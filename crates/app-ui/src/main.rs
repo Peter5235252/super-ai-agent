@@ -535,7 +535,7 @@ impl SuperAiApp {
                 content: "Stopped. What would you like to do instead?".to_string(),
                 reasoning: String::new(),
             });
-            self.push_activity("err", "stopped by user (ESC x2)");
+            self.push_activity("err", "stopped by user (ESC x2)".to_string());
             self.notice = Some("Agent stopped.".to_string());
         } else {
             self.notice = Some("Nothing running.".to_string());
