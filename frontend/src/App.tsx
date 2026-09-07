@@ -1145,6 +1145,5 @@ function ProvidersModal(props: {
           {result && <div className="test-result">{result}</div>}
         </div>
       </div>
-    </div>
   );
 }
