@@ -1,0 +1,11 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Release copy of the native binary (built via cargo build --release -p app-ui)
+/Super-AI.exe
+
+# Local
+*.log
+.DS_Store
+Thumbs.db

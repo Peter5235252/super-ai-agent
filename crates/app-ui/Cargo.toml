@@ -1,0 +1,33 @@
+[package]
+name = "app-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "super-ai-native"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+agent-runtime = { workspace = true }
+app-core = { workspace = true }
+persistence = { workspace = true }
+policy-engine = { workspace = true }
+provider-api = { workspace = true }
+provider-openai = { workspace = true }
+provider-anthropic = { workspace = true }
+provider-xai = { workspace = true }
+provider-compat = { workspace = true }
+tool-core = { workspace = true }
+tool-filesystem = { workspace = true }
+tool-process = { workspace = true }
+secrets = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

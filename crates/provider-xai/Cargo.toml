@@ -1,0 +1,11 @@
+[package]
+name = "provider-xai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+provider-api = { workspace = true }
+provider-openai = { workspace = true }
+async-trait = { workspace = true }
+secrecy = { workspace = true }
