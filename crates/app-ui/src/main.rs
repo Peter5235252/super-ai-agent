@@ -25,7 +25,7 @@ use provider_api::ReasoningEffort;
 use provider_api::{Message, MessageRole, ModelInfo, ModelProvider};
 use secrecy::SecretString;
 use tokio::sync::broadcast;
-use tool_core::{Tool, ToolContext};
+use tool_core::ToolContext;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -208,6 +208,7 @@ enum UiUpdate {
 }
 
 /// One self-test row: `ok` is None for "skipped".
+#[derive(Clone)]
 struct DiagRow {
     name: String,
     ok: Option<bool>,
