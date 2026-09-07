@@ -2,7 +2,7 @@
 
 A Windows 11 desktop AI agent built in memory-safe Rust — 100% native
 (egui, no WebView, no dev server). Bring Your Own API Key (BYOK) — OpenAI,
-Anthropic, xAI (Grok), Mistral, Google Gemini — plus local LLMs via Ollama
+Anthropic, SpaceXAI, Mistral, Google Gemini — plus local LLMs via Ollama
 or any OpenAI-compatible server (LM Studio, vLLM) — with live-streaming
 chat, an event-driven agent runtime, workspace-confined filesystem tools, a
 terminal tool (PowerShell/cmd), a policy engine with human approval gates,
@@ -14,10 +14,10 @@ and SQLite persistence.
 
 ## What works today
 
-- **BYOK providers**: OpenAI (GPT-6 Astra, GPT-5.6 Sol/Terra/Luna/Cyber),
-  Anthropic (Claude Fable 5.1, Opus 5, Sonnet 5, Haiku 4.5), xAI (Grok 4.6),
+- **BYOK providers**: OpenAI (GPT-6 Astra, GPT-5.6 Sol/Terra/Luna),
+  Anthropic (Claude Fable 5.1, Opus 5, Sonnet 5, Haiku 4.5), SpaceXAI (Grok 4.6),
   Mistral (Large, Medium, Small, Codestral, Devstral), Google Gemini
-  (3 Pro/Flash, 2.5 Pro/Flash via the OpenAI-compat shim), Ollama
+  (3.8 Flash, 3.1 Pro via the OpenAI-compat shim), Ollama
   (llama4:scout, qwen3, llama3.1, mistral, …) and generic local servers
   (LM Studio :1234, vLLM :8000 — no key needed).
   Keys are stored in the **Windows Credential Manager** via `keyring` —
