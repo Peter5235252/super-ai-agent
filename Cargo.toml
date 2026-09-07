@@ -15,6 +15,7 @@ members = [
     "crates/persistence",
     "crates/secrets",
     "crates/app-ui",
+    "src-tauri",
 ]
 
 [workspace.package]
