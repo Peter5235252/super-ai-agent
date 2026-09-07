@@ -150,6 +150,7 @@ pub struct TaskRequest {
     pub workspace: Option<WorkspaceConfig>,
     pub tools: ToolRegistry,
     pub max_turns: u32,
+    pub reasoning_effort: Option<provider_api::ReasoningEffort>,
 }
 
 #[derive(Default)]
@@ -261,6 +262,7 @@ impl Agent {
                 system: req.system_prompt.clone(),
                 temperature: None,
                 max_tokens: None,
+                reasoning_effort: req.reasoning_effort,
             };
 
             // Stream the model's response, with bounded retry on failure.

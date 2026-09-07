@@ -33,6 +33,8 @@ pub struct SessionRow {
     pub provider_name: Option<String>,
     pub model: Option<String>,
     pub status: String,
+    /// Reasoning effort override (off/low/medium/high/max); None = Default.
+    pub reasoning_effort: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -177,6 +179,20 @@ impl Db {
         .bind(session)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn set_session_effort(
+        &self,
+        session: SessionId,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sessions SET reasoning_effort = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(effort)
+            .bind(now_ms())
+            .bind(session)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

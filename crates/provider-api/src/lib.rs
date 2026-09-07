@@ -211,6 +211,53 @@ pub struct ToolDefinitionWire {
     pub input_schema: serde_json::Value,
 }
 
+/// How hard the model should think before answering. `None` (absent)
+/// means "provider default". Each adapter maps these levels to its own
+/// parameters (reasoning effort, thinking budget, …); adapters for servers
+/// without such a knob ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "Off",
+            ReasoningEffort::Low => "Low",
+            ReasoningEffort::Medium => "Medium",
+            ReasoningEffort::High => "High",
+            ReasoningEffort::Max => "Max",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(ReasoningEffort::Off),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "max" => Some(ReasoningEffort::Max),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "off",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        }
+    }
+}
+
 /// One model-call request. Providers convert this into their native format.
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -220,6 +267,7 @@ pub struct AgentRequest {
     pub system: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Token + optional cost accounting for a completed model call.

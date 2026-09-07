@@ -18,6 +18,7 @@ use agent_runtime::{Agent, AgentEvent, TaskRequest, TaskSummary, ToolRegistry};
 use app_core::{ApprovalDecision, RiskClass, WorkspaceConfig, now_ms};
 use futures::StreamExt;
 use lucide_icons::Icon;
+use provider_api::ReasoningEffort;
 use persistence::{Db, MessageRow, ProviderRow, SessionRow};
 use policy_engine::PolicyEngine;
 use provider_api::{Message, MessageRole, ModelInfo, ModelProvider};
@@ -243,6 +244,8 @@ struct SuperAiApp {
     notice: Option<String>,
     last_summary: Option<TaskSummary>,
     autonomy: RiskClass,
+    /// Per-session reasoning effort override (None = provider default).
+    effort_sel: Option<ReasoningEffort>,
 
     show_providers: bool,
     new_workspace: String,
@@ -297,6 +300,7 @@ impl SuperAiApp {
             notice: None,
             last_summary: None,
             autonomy: RiskClass::Low,
+            effort_sel: None,
             show_providers: false,
             new_workspace: String::new(),
             draft: String::new(),
@@ -404,6 +408,7 @@ impl SuperAiApp {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
             self.provider_sel = s.provider_name.clone().unwrap_or_default();
             self.model_sel = s.model.clone().unwrap_or_default();
+            self.effort_sel = s.reasoning_effort.as_deref().and_then(ReasoningEffort::parse);
         }
         self.load_messages(id);
     }
@@ -415,12 +420,16 @@ impl SuperAiApp {
         self.new_workspace.clear();
         self.spawn(async move {
             let id = Uuid::new_v4();
-            let ws_opt = if ws.is_empty() {
-                None
+            // Blank input falls back to ~/Super-AI so file and terminal
+            // tools work immediately instead of failing outright.
+            let ws_path = if ws.is_empty() {
+                let dir = default_workspace_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                dir.to_string_lossy().to_string()
             } else {
-                Some(ws.as_str())
+                ws
             };
-            match db.create_session(id, "New session", ws_opt).await {
+            match db.create_session(id, "New session", Some(ws_path.as_str())).await {
                 Ok(row) => {
                     let _ = tx.send(UiUpdate::SessionCreated(row));
                 }
@@ -774,6 +783,7 @@ impl SuperAiApp {
                         self.approvals.clear();
                         self.provider_sel.clear();
                         self.model_sel.clear();
+                        self.effort_sel = None;
                     }
                 }
                 UiUpdate::Agent(ev) => self.apply_event(ev),
@@ -1076,6 +1086,7 @@ async fn test_provider_inner(db: &Db, name: &str) -> Result<String, String> {
                 system: None,
                 temperature: None,
                 max_tokens: Some(16),
+                reasoning_effort: None,
             };
             let mut stream = provider
                 .stream_response(&req)
@@ -1156,9 +1167,15 @@ async fn send_message_inner(
         .map_err(|e| format!("{e}"))?;
     let history: Vec<Message> = rows.iter().filter_map(to_internal_message).collect();
 
-    // Workspace tools (files + terminal) are confined to the workspace root.
-    let workspace = session
-        .workspace
+    // Every session gets a confined root: the bound folder, or the
+    // ~/Super-AI fallback for older sessions. File + terminal tools are
+    // always attached, so listing/reading/writing and PowerShell just work.
+    let workspace_path = session.workspace.clone().or_else(|| {
+        let dir = default_workspace_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.to_string_lossy().to_string())
+    });
+    let workspace = workspace_path
         .as_deref()
         .map(|w| WorkspaceConfig::from_dir(session.title.clone(), PathBuf::from(w)));
     let mut tools: Vec<Arc<dyn tool_core::Tool>> = Vec::new();
@@ -1184,16 +1201,29 @@ async fn send_message_inner(
         .await
         .map_err(|e| format!("{e}"))?;
 
+    let mut system = SYSTEM_PROMPT.to_string();
+    if let Some(root) = workspace.as_ref().and_then(|ws| ws.root()) {
+        system.push_str(&format!(
+            "\n\nYour workspace folder is: {}\nList, read and write files there, and run terminal commands from there.",
+            root.display()
+        ));
+    }
+    let reasoning_effort = session
+        .reasoning_effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse);
+
     let request = TaskRequest {
         session_id,
         provider,
         model,
-        system_prompt: Some(SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(system),
         history,
         user_message: text,
         workspace,
         tools: registry,
         max_turns: 32,
+        reasoning_effort,
     };
 
     // The handle is dropped deliberately; the task keeps running and its
@@ -1515,7 +1545,7 @@ impl eframe::App for SuperAiApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_workspace)
-                            .hint_text("Workspace path (optional)")
+                            .hint_text("Folder for files (blank = Super-AI folder)")
                             .desired_width(f32::INFINITY),
                     );
                 });
@@ -1585,6 +1615,45 @@ impl eframe::App for SuperAiApp {
                 });
                 ui.label(
                     egui::RichText::new("Auto-approves at or below this risk.")
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(li(Icon::Brain));
+                    ui.label("Reasoning");
+                    ui.add_enabled_ui(self.active_id.is_some(), |ui| {
+                        let before = self.effort_sel;
+                        egui::ComboBox::from_id_salt("effort")
+                            .selected_text(
+                                self.effort_sel.map(|e| e.label()).unwrap_or("Default"),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.effort_sel, None, "Default");
+                                for e in [
+                                    ReasoningEffort::Off,
+                                    ReasoningEffort::Low,
+                                    ReasoningEffort::Medium,
+                                    ReasoningEffort::High,
+                                    ReasoningEffort::Max,
+                                ] {
+                                    ui.selectable_value(&mut self.effort_sel, Some(e), e.label());
+                                }
+                            });
+                        if self.effort_sel != before {
+                            let effort = self.effort_sel;
+                            if let Some(id) = self.active_id {
+                                let db = self.db.clone();
+                                let s = effort.map(|e| e.as_str().to_string());
+                                self.spawn(async move {
+                                    let _ =
+                                        db.set_session_effort(id, s.as_deref()).await;
+                                });
+                            }
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new("How hard this session's model thinks.")
                         .small()
                         .weak(),
                 );
@@ -1681,8 +1750,9 @@ impl eframe::App for SuperAiApp {
                                 ui.label(egui::RichText::new("2. Create a session").strong());
                             });
                             ui.label(
-                                "Optionally type a folder path in the sidebar so the AI can \
-                                 work with your files, then press New session.",
+                                "Type a folder path in the sidebar, or leave it blank to use \
+                                 your Super-AI folder, then press New session. The AI can \
+                                 list, read and write files there and run terminal commands.",
                             );
                             if ui.button("New session").clicked() {
                                 self.create_session();
@@ -2140,6 +2210,16 @@ fn data_dir() -> PathBuf {
     }
 }
 
+/// Home for sessions without an explicit folder: `%USERPROFILE%\Super-AI`.
+/// Tools always have a confined root, so file and terminal commands work
+/// out of the box instead of failing with "bind a workspace first".
+fn default_workspace_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| data_dir())
+        .join("Super-AI")
+}
+
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -2243,6 +2323,7 @@ mod tests {
             Icon::Cpu,
             Icon::Send,
             Icon::RefreshCw,
+            Icon::Brain,
         ];
         let mut missing = Vec::new();
         for ic in used {
@@ -2290,6 +2371,7 @@ mod tests {
             Icon::Cpu,
             Icon::Send,
             Icon::RefreshCw,
+            Icon::Brain,
         ];
         let mut missing = Vec::new();
         for ic in used {

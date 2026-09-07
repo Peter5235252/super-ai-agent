@@ -137,6 +137,11 @@ impl ResponsesClient {
         if let Some(max) = request.max_tokens {
             body["max_output_tokens"] = json!(max);
         }
+        // Reasoning effort. `Off` is intentionally omitted: several models
+        // (notably Astra) reject `"none"`, and omitting keeps their default.
+        if let Some(reasoning) = reasoning_body(self.kind, request.reasoning_effort) {
+            body["reasoning"] = reasoning;
+        }
 
         let resp = self
             .http
@@ -205,8 +210,25 @@ impl ModelProvider for OpenAiProvider {
     }
 }
 
-fn build_input(messages: &[Message]) -> Vec<Value> {
-    let mut items = Vec::new();
+/// Map a UI reasoning level to the Responses `reasoning` parameter.
+/// Grok tops out at `xhigh`; OpenAI goes to `max`.
+fn reasoning_body(
+    kind: ProviderKind,
+    effort: Option<provider_api::ReasoningEffort>,
+) -> Option<Value> {
+    use provider_api::ReasoningEffort::*;
+    let level = match effort? {
+        Off => return None,
+        Low => "low",
+        Medium => "medium",
+        High => "high",
+        Max if kind == ProviderKind::Xai => "xhigh",
+        Max => "max",
+    };
+    Some(json!({ "effort": level }))
+}
+
+fn build_input(messages: &[Message]) -> Vec<Value> {    let mut items = Vec::new();
     for m in messages {
         match m.role {
             MessageRole::System => items.push(json!({"role": "system", "content": m.content})),
@@ -373,6 +395,25 @@ mod tests {
         let m = models::resolve_model("gpt-9.9-future");
         assert_eq!(m.id, "gpt-9.9-future");
         assert!(m.capabilities.tool_calling);
+    }
+
+    #[test]
+    fn reasoning_body_maps_per_kind() {
+        use provider_api::{ProviderKind, ReasoningEffort};
+        assert_eq!(reasoning_body(ProviderKind::OpenAI, None), None);
+        assert_eq!(reasoning_body(ProviderKind::OpenAI, Some(ReasoningEffort::Off)), None);
+        assert_eq!(
+            reasoning_body(ProviderKind::OpenAI, Some(ReasoningEffort::Max)),
+            Some(json!({ "effort": "max" }))
+        );
+        assert_eq!(
+            reasoning_body(ProviderKind::Xai, Some(ReasoningEffort::Max)),
+            Some(json!({ "effort": "xhigh" }))
+        );
+        assert_eq!(
+            reasoning_body(ProviderKind::Xai, Some(ReasoningEffort::Medium)),
+            Some(json!({ "effort": "medium" }))
+        );
     }
 
     #[test]

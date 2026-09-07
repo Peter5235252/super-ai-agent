@@ -207,6 +207,12 @@ impl CompatProvider {
         if let Some(max) = request.max_tokens {
             body["max_tokens"] = json!(max);
         }
+        // Reasoning effort for servers that honor it (Gemini's compat shim
+        // maps `reasoning_effort`; others ignore unknown fields). `Off` is
+        // omitted: there is no portable way to disable thinking.
+        if let Some(level) = request.reasoning_effort.and_then(compat_effort) {
+            body["reasoning_effort"] = json!(level);
+        }
 
         let resp = self
             .apply_auth(self.http.post(&url))
@@ -261,8 +267,19 @@ impl ModelProvider for CompatProvider {
     }
 }
 
-fn build_messages(messages: &[Message], system: Option<&str>) -> Vec<Value> {
-    let mut items = Vec::new();
+/// Map a UI reasoning level to the OpenAI-style `reasoning_effort` value.
+fn compat_effort(effort: provider_api::ReasoningEffort) -> Option<&'static str> {
+    use provider_api::ReasoningEffort::*;
+    match effort {
+        Off => None,
+        Low => Some("low"),
+        Medium => Some("medium"),
+        High => Some("high"),
+        Max => Some("max"),
+    }
+}
+
+fn build_messages(messages: &[Message], system: Option<&str>) -> Vec<Value> {    let mut items = Vec::new();
     if let Some(system) = system.filter(|s| !s.is_empty()) {
         items.push(json!({"role": "system", "content": system}));
     }
@@ -726,8 +743,16 @@ mod tests {
         )));
     }
 
-    fn chunk_with_text(t: &str) -> String {
-        serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": null}]})
+    #[test]
+    fn effort_mapping() {
+        use provider_api::ReasoningEffort;
+        assert_eq!(compat_effort(ReasoningEffort::Off), None);
+        assert_eq!(compat_effort(ReasoningEffort::Low), Some("low"));
+        assert_eq!(compat_effort(ReasoningEffort::High), Some("high"));
+        assert_eq!(compat_effort(ReasoningEffort::Max), Some("max"));
+    }
+
+    fn chunk_with_text(t: &str) -> String {        serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": null}]})
             .to_string()
     }
 

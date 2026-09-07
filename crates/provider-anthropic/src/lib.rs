@@ -90,6 +90,17 @@ impl AnthropicProvider {
             "stream": true,
             "messages": messages,
         });
+        // Extended thinking. The output cap must leave room for the
+        // thinking budget on top of the visible answer.
+        if let Some(budget) = request
+            .reasoning_effort
+            .and_then(thinking_budget)
+        {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            let floor = budget + 4096;
+            let max = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(floor);
+            body["max_tokens"] = json!(max);
+        }
         if let Some(system) = system {
             body["system"] = json!(system);
         }
@@ -269,6 +280,19 @@ fn map_anth_event(state: &mut AnthState, ev: SseEvent) -> Vec<ProviderEvent> {
     }
 }
 
+/// Map a UI reasoning level to Anthropic's thinking budget (tokens).
+/// `None` (and `Off`) means standard non-thinking mode.
+fn thinking_budget(effort: provider_api::ReasoningEffort) -> Option<u32> {
+    use provider_api::ReasoningEffort::*;
+    match effort {
+        Off => None,
+        Low => Some(4096),
+        Medium => Some(10_000),
+        High => Some(20_000),
+        Max => Some(32_000),
+    }
+}
+
 /// Merge the request-level system prompt with any system messages found
 /// in history. Either side may be absent; both are kept when present.
 fn merge_system(request: Option<&str>, history: Option<String>) -> Option<String> {
@@ -380,6 +404,17 @@ mod tests {
         assert!(ids.iter().any(|id| id == "claude-fable-5-1"));
         assert!(ids.iter().any(|id| id == "claude-opus-5"));
         assert!(ids.iter().any(|id| id == "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn thinking_budgets_escalate() {
+        use provider_api::ReasoningEffort;
+        assert_eq!(thinking_budget(ReasoningEffort::Off), None);
+        let low = thinking_budget(ReasoningEffort::Low).unwrap();
+        let med = thinking_budget(ReasoningEffort::Medium).unwrap();
+        let high = thinking_budget(ReasoningEffort::High).unwrap();
+        let max = thinking_budget(ReasoningEffort::Max).unwrap();
+        assert!(low >= 1024 && low < med && med < high && high < max);
     }
 
     #[test]
