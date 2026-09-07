@@ -36,7 +36,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "OpenAI",
             ProviderKind::Anthropic => "Anthropic",
             ProviderKind::Google => "Google",
-            ProviderKind::Xai => "xAI (Grok)",
+            ProviderKind::Xai => "SpaceXAI (Grok)",
             ProviderKind::Mistral => "Mistral",
             ProviderKind::Ollama => "Ollama",
             ProviderKind::Local => "Local",

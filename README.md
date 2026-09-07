@@ -2,7 +2,7 @@
 
 A Windows 11 desktop AI agent built in memory-safe Rust — 100% native
 (egui, no WebView, no dev server). Bring Your Own API Key (BYOK) — OpenAI,
-Anthropic, SpaceXAI, Mistral, Google Gemini — plus local LLMs via Ollama
+Anthropic, SpaceXAI (Grok), Mistral, Google Gemini — plus local LLMs via Ollama
 or any OpenAI-compatible server (LM Studio, vLLM) — with live-streaming
 chat, an event-driven agent runtime, workspace-confined filesystem tools, a
 terminal tool (PowerShell/cmd), a policy engine with human approval gates,
@@ -43,25 +43,27 @@ and SQLite persistence.
 
 | Provider | Model | Context | $ in/out per MTok | Notes |
 |---|---|---|---|---|
-| OpenAI | `gpt-6-astra` | — | — | Newest frontier (Sep 2026); SOTA computer use / browsing / SWE |
-| OpenAI | `gpt-5.6-sol` | — | 5 / 30 | Flagship 5.6; best coding/agentic |
-| OpenAI | `gpt-5.6-terra` | — | 2.50 / 15 | Mid tier |
-| OpenAI | `gpt-5.6-luna` | — | 1 / 6 | Fast/cheap |
-| OpenAI | `gpt-5.6-cyber` | — | — | Daybreak cyber variant |
+| OpenAI | `gpt-6-astra` | 1.05M | 10 / 50 | Flagship (Sep 3, 2026); computer use/agents |
+| OpenAI | `gpt-5.6-sol` | 1.05M | 4 / 20 | Flagship 5.6; promo thru Nov 21, 2026 (list 5/30) |
+| OpenAI | `gpt-5.6-terra` | 1.05M | 2 / 12 | Balanced production tier |
+| OpenAI | `gpt-5.6-luna` | 1.05M | 0.20 / 1.20 | Cheapest/fastest 5.6 |
+| OpenAI | `gpt-5.6-cyber` | — | 12.50 / 75 | Controlled-access Daybreak variant |
 | Anthropic | `claude-fable-5-1` | 1M | 10 / 50 | Most advanced; adaptive thinking |
 | Anthropic | `claude-opus-5` | 1M | 5 / 25 | Recommended default |
 | Anthropic | `claude-sonnet-5` | 1M | 2 / 10 | Fast; temperature must stay default |
 | Anthropic | `claude-haiku-4-5` | 200K | 1 / 5 | Cheapest tier |
-| xAI | `grok-4.6` | 500K | 2 / 6 | Native web/X search; reasoning low→xhigh |
+| SpaceXAI | `grok-4.6` | 500K | 2 / 6 | Flagship (Aug 2026); web/X search; reasoning to xhigh |
+| SpaceXAI | `grok-4.5` | 500K | 2 / 6 | Previous flagship; cheaper cached input |
+| SpaceXAI | `grok-4.3` | 1M | 1.25 / 2.50 | Cost-efficient reasoning |
+| SpaceXAI | `grok-build-0.1` | 256K | 1 / 2 | Coding specialist |
 | Mistral | `mistral-large-latest` | 128K | 3 / 9 | Flagship; EU data residency |
 | Mistral | `mistral-medium-latest` | — | 2.70 / 8.10 | Reliable function calling |
 | Mistral | `mistral-small-latest` | — | 0.20 / 0.60 | Price-performance pick |
 | Mistral | `codestral-latest` | — | 0.30 / 0.90 | Code-specialized; best for coding agents |
 | Mistral | `devstral-latest` | — | — | Agentic coding; confirm id in Mistral docs |
-| Google | `gemini-3-pro` | — | — | Frontier reasoning; confirm id in AI Studio |
-| Google | `gemini-3-flash` | — | — | Fast/cheap reasoning tier |
-| Google | `gemini-2.5-pro` | — | — | Long-context workhorse |
-| Google | `gemini-2.5-flash` | — | — | High-volume extraction tier |
+| Google | `gemini-3.8-flash` | 1M | 0.75 / 3.75 | Newest (Sep 2, 2026); coding/agents; intro rate thru 2026 |
+| Google | `gemini-3.7-flash` | — | 0.75 / 3.75 | Previous Flash; intro rate thru 2026 |
+| Google | `gemini-3.1-pro-preview` | 1M | 2.50 / 15 | Flagship reasoning; paid tier only |
 | Ollama | `llama4:scout` | — | 0 (local) | Best local agentic quality (~12 GB) |
 | Ollama | `qwen3:14b` / `qwen3:8b` | — | 0 (local) | Strong local tool calling |
 | Ollama | `llama3.1:8b` | — | 0 (local) | Legacy, solid tools |

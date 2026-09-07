@@ -11,9 +11,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
-use agent_runtime::{Agent, AgentEvent, TaskRequest, ToolRegistry};
+use agent_runtime::{Agent, AgentEvent, TaskRequest, TaskSummary, ToolRegistry};
 use app_core::{ApprovalDecision, RiskClass, WorkspaceConfig, now_ms};
 use futures::StreamExt;
+use lucide_icons::Icon;
 use persistence::{Db, MessageRow, ProviderRow, SessionRow};
 use policy_engine::PolicyEngine;
 use provider_api::{Message, MessageRole, ModelInfo, ModelProvider};
@@ -60,7 +61,7 @@ fn model_hints(kind: &str) -> &'static [&'static str] {
             "claude-sonnet-5",
             "claude-haiku-4-5",
         ],
-        "xai" => &["grok-4.6"],
+        "xai" => &["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"],
         "mistral" => &[
             "mistral-large-latest",
             "mistral-medium-latest",
@@ -69,10 +70,10 @@ fn model_hints(kind: &str) -> &'static [&'static str] {
             "devstral-latest",
         ],
         "gemini" => &[
-            "gemini-3-pro",
-            "gemini-3-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.6-flash",
         ],
         "ollama" => &[
             "llama4:scout",
@@ -101,6 +102,25 @@ fn key_required(kind: &str) -> bool {
     matches!(kind, "openai" | "anthropic" | "xai" | "mistral" | "gemini")
 }
 
+/// Display name for a stored provider-kind id.
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        "xai" => "SpaceXAI",
+        "mistral" => "Mistral",
+        "gemini" => "Gemini",
+        "ollama" => "Ollama",
+        "local" => "Local",
+        _ => "Custom",
+    }
+}
+
+/// One Lucide glyph in the bundled icon font.
+fn li(ic: Icon) -> egui::RichText {
+    egui::RichText::new(char::from(ic).to_string()).family(egui::FontFamily::Name("lucide".into()))
+}
+
 // ---------------------------------------------------------------------------
 // Background -> UI channel
 // ---------------------------------------------------------------------------
@@ -118,6 +138,7 @@ enum UiUpdate {
     ProviderTested(String),
     Agent(AgentEvent),
     SendFailed(String),
+    SessionGone(Uuid),
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +182,8 @@ struct SuperAiApp {
     providers: Vec<ProviderRow>,
     keys: HashMap<String, bool>,
     notice: Option<String>,
+    last_summary: Option<TaskSummary>,
+    autonomy: RiskClass,
 
     show_providers: bool,
     new_workspace: String,
@@ -204,6 +227,8 @@ impl SuperAiApp {
             providers: Vec::new(),
             keys: HashMap::new(),
             notice: None,
+            last_summary: None,
+            autonomy: RiskClass::Low,
             show_providers: false,
             new_workspace: String::new(),
             draft: String::new(),
@@ -328,6 +353,29 @@ impl SuperAiApp {
                     let _ = tx.send(UiUpdate::Notice(format!("new session: {e}")));
                 }
             }
+        });
+    }
+
+    fn delete_session(&mut self, id: Uuid) {
+        let db = self.db.clone();
+        let tx = self.tx.clone();
+        self.spawn(async move {
+            match db.delete_session(id).await {
+                Ok(()) => {
+                    let _ = tx.send(UiUpdate::SessionGone(id));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiUpdate::Notice(format!("delete session: {e}")));
+                }
+            }
+        });
+    }
+
+    fn set_autonomy(&mut self, risk: RiskClass) {
+        self.autonomy = risk;
+        let policy = self.policy.clone();
+        self.spawn(async move {
+            policy.set_auto_approve(risk).await;
         });
     }
 
@@ -565,6 +613,18 @@ impl SuperAiApp {
                     self.push_activity("err", e);
                     self.streaming = false;
                 }
+                UiUpdate::SessionGone(id) => {
+                    self.sessions.retain(|s| s.id != id);
+                    if self.active_id == Some(id) {
+                        self.active_id = None;
+                        self.messages.clear();
+                        self.stream.clear();
+                        self.streaming = false;
+                        self.approvals.clear();
+                        self.provider_sel.clear();
+                        self.model_sel.clear();
+                    }
+                }
                 UiUpdate::Agent(ev) => self.apply_event(ev),
             }
         }
@@ -590,7 +650,7 @@ impl SuperAiApp {
             }
             AgentEvent::ToolRequested { tool, args, .. } => {
                 let arg_str = serde_json::to_string(&args).unwrap_or_default();
-                self.push_activity("tool", format!("→ {tool}({arg_str})"));
+                self.push_activity("tool", format!("{tool}({arg_str})"));
             }
             AgentEvent::ToolOutput { tool, output, .. } => {
                 let mut short: String = output.chars().take(300).collect();
@@ -620,18 +680,45 @@ impl SuperAiApp {
                 self.push_activity(
                     "ok",
                     format!(
-                        "✓ task done · {} turns · {}+{} tokens",
+                        "task done · {} turns · {}+{} tokens",
                         summary.turns, summary.input_tokens, summary.output_tokens
                     ),
                 );
+                self.last_summary = Some(summary);
                 self.streaming = false;
             }
             AgentEvent::TaskFailed { error, .. } => {
-                self.push_activity("err", format!("✗ {error}"));
+                self.push_activity("err", error);
                 self.streaming = false;
             }
             _ => {}
         }
+    }
+}
+
+/// One-line catalog summary: context window + prices + cutoff.
+fn catalog_line(m: &ModelInfo) -> String {
+    let mut parts = Vec::new();
+    if let Some(ctx) = m.context_window {
+        if ctx >= 1_000_000 {
+            parts.push(format!("{:.2}M ctx", ctx as f64 / 1_000_000.0));
+        } else {
+            parts.push(format!("{}K ctx", ctx / 1_000));
+        }
+    }
+    if let (Some(i), Some(o)) = (m.input_price_per_mtok, m.output_price_per_mtok) {
+        parts.push(format!("${i}/${o} per MTok"));
+    }
+    if let Some(cutoff) = &m.knowledge_cutoff {
+        parts.push(format!("cutoff {cutoff}"));
+    }
+    if let Some(notes) = &m.notes {
+        parts.push(notes.clone());
+    }
+    if parts.is_empty() {
+        "no metadata".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -1055,7 +1142,8 @@ impl eframe::App for SuperAiApp {
         egui::Panel::top("brand").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("◆ Super-AI");
+                ui.label(li(Icon::Bot).size(20.0).strong());
+                ui.heading("Super-AI");
                 ui.separator();
                 ui.label(
                     egui::RichText::new("native Rust · no webview")
@@ -1064,6 +1152,16 @@ impl eframe::App for SuperAiApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if active.is_some() {
+                        if let Some(s) = &self.last_summary {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} turns · {}+{} tok",
+                                    s.turns, s.input_tokens, s.output_tokens
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
                         let can_apply =
                             !self.provider_sel.is_empty() && !self.model_sel.trim().is_empty();
                         if ui
@@ -1125,7 +1223,10 @@ impl eframe::App for SuperAiApp {
             .resizable(true)
             .default_size(240.0)
             .show(ui, |ui| {
-                ui.heading("Sessions");
+                ui.horizontal(|ui| {
+                    ui.label(li(Icon::MessageSquare).strong());
+                    ui.heading("Sessions");
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.add(
@@ -1134,9 +1235,12 @@ impl eframe::App for SuperAiApp {
                             .desired_width(f32::INFINITY),
                     );
                 });
-                if ui.button("+ New session").clicked() {
-                    self.create_session();
-                }
+                ui.horizontal(|ui| {
+                    ui.label(li(Icon::Plus));
+                    if ui.button("New session").clicked() {
+                        self.create_session();
+                    }
+                });
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -1145,6 +1249,7 @@ impl eframe::App for SuperAiApp {
                             ui.label(egui::RichText::new("No sessions yet").weak());
                         }
                         let mut open: Option<Uuid> = None;
+                        let mut gone: Option<Uuid> = None;
                         for s in &self.sessions {
                             let selected = self.active_id == Some(s.id);
                             let title = format!(
@@ -1153,20 +1258,61 @@ impl eframe::App for SuperAiApp {
                                 s.provider_name.as_deref().unwrap_or("no provider"),
                                 s.model.as_deref().unwrap_or("no model")
                             );
-                            if ui.selectable_label(selected, title).clicked() {
-                                open = Some(s.id);
-                            }
+                            ui.horizontal(|ui| {
+                                let resp = ui.add_sized(
+                                    egui::vec2(ui.available_width() - 30.0, 0.0),
+                                    egui::Button::selectable(selected, title),
+                                );
+                                if resp.clicked() {
+                                    open = Some(s.id);
+                                }
+                                if ui
+                                    .button(li(Icon::X))
+                                    .on_hover_text("Delete session")
+                                    .clicked()
+                                {
+                                    gone = Some(s.id);
+                                }
+                            });
                         }
                         if let Some(id) = open {
                             self.open_session(id);
                         }
+                        if let Some(id) = gone {
+                            self.delete_session(id);
+                        }
                     });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(li(Icon::SlidersHorizontal));
+                    ui.label("Autonomy");
+                    egui::ComboBox::from_id_salt("autonomy")
+                        .selected_text(self.autonomy.label())
+                        .show_ui(ui, |ui| {
+                            for r in [RiskClass::Low, RiskClass::Medium, RiskClass::High] {
+                                if ui
+                                    .selectable_value(&mut self.autonomy, r, r.label())
+                                    .clicked()
+                                {
+                                    self.set_autonomy(r);
+                                }
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new("Auto-approves at or below this risk.")
+                        .small()
+                        .weak(),
+                );
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("v0.2.0 · BYOK").weak().small());
-                    if ui.button("⚙ Providers & keys").clicked() {
-                        self.show_providers = true;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label(li(Icon::Settings));
+                        if ui.button("Providers & keys").clicked() {
+                            self.show_providers = true;
+                        }
+                    });
                 });
             });
 
@@ -1229,30 +1375,44 @@ impl eframe::App for SuperAiApp {
                     }
                     for m in &self.messages {
                         ui.add_space(6.0);
-                        let (head, color) = if m.role == "user" {
-                            ("you", egui::Color32::LIGHT_BLUE)
+                        let (ic, head, color) = if m.role == "user" {
+                            (Icon::User, "you", egui::Color32::LIGHT_BLUE)
                         } else {
-                            ("assistant", egui::Color32::LIGHT_GREEN)
+                            (Icon::Bot, "assistant", egui::Color32::LIGHT_GREEN)
                         };
-                        ui.label(egui::RichText::new(head).small().strong().color(color));
-                        ui.label(m.content.as_str());
-                        ui.separator();
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(li(ic).color(color));
+                                ui.label(
+                                    egui::RichText::new(head).small().strong().color(color),
+                                );
+                            });
+                            ui.label(m.content.as_str());
+                        });
                     }
                     if !self.stream.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("assistant · streaming")
-                                .small()
-                                .strong()
-                                .color(egui::Color32::LIGHT_GREEN),
-                        );
-                        ui.label(format!("{}▍", self.stream));
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(li(Icon::Bot).color(egui::Color32::LIGHT_GREEN));
+                                ui.label(
+                                    egui::RichText::new("assistant · streaming")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::LIGHT_GREEN),
+                                );
+                            });
+                            ui.label(format!("{}▍", self.stream));
+                        });
                     }
                 });
 
             if !self.approvals.is_empty() {
                 ui.separator();
-                ui.heading("Approvals");
+                ui.horizontal(|ui| {
+                    ui.label(li(Icon::ShieldAlert).strong());
+                    ui.heading("Approvals");
+                });
                 let mut answer: Option<(Uuid, bool)> = None;
                 for card in &self.approvals {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1262,9 +1422,8 @@ impl eframe::App for SuperAiApp {
                                 "MEDIUM" => egui::Color32::GOLD,
                                 _ => egui::Color32::GRAY,
                             };
-                            ui.label(
-                                egui::RichText::new(&card.risk).strong().color(color),
-                            );
+                            ui.label(li(Icon::TriangleAlert).color(color));
+                            ui.label(egui::RichText::new(&card.risk).strong().color(color));
                             ui.label(egui::RichText::new(&card.tool).strong().monospace());
                         });
                         let args = serde_json::to_string_pretty(&card.args)
@@ -1292,13 +1451,16 @@ impl eframe::App for SuperAiApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         for a in self.activity.iter().rev().take(20) {
-                            let color = match a.kind {
-                                "err" => egui::Color32::LIGHT_RED,
-                                "ok" => egui::Color32::LIGHT_GREEN,
-                                "tool" => egui::Color32::LIGHT_BLUE,
-                                _ => egui::Color32::GRAY,
+                            let (ic, color) = match a.kind {
+                                "err" => (Icon::X, egui::Color32::LIGHT_RED),
+                                "ok" => (Icon::Check, egui::Color32::LIGHT_GREEN),
+                                "tool" => (Icon::Terminal, egui::Color32::LIGHT_BLUE),
+                                _ => (Icon::ArrowRight, egui::Color32::GRAY),
                             };
-                            ui.label(egui::RichText::new(&a.text).small().color(color));
+                            ui.horizontal(|ui| {
+                                ui.label(li(ic).small().color(color));
+                                ui.label(egui::RichText::new(&a.text).small().color(color));
+                            });
                         }
                     });
             }
@@ -1328,18 +1490,34 @@ impl eframe::App for SuperAiApp {
                             ui.label(egui::RichText::new(&p.name).strong());
                             ui.label(format!(
                                 "{} · {}",
-                                p.kind,
+                                kind_label(&p.kind),
                                 p.default_model.as_deref().unwrap_or("no default model")
                             ));
                             let keyed = self.keys.get(&p.name).copied().unwrap_or(false);
-                            ui.label(if keyed { "🔑 key" } else { "⚠ no key" });
+                            ui.horizontal(|ui| {
+                                if keyed {
+                                    ui.label(li(Icon::KeyRound).color(egui::Color32::LIGHT_GREEN));
+                                    ui.label("key");
+                                } else {
+                                    ui.label(li(Icon::TriangleAlert).color(egui::Color32::GOLD));
+                                    ui.label("no key");
+                                }
+                            });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Delete").clicked() {
+                                    if ui
+                                        .button(li(Icon::Trash2))
+                                        .on_hover_text("Delete provider")
+                                        .clicked()
+                                    {
                                         delete = Some(p.name.clone());
                                     }
-                                    if ui.button("Test").clicked() {
+                                    if ui
+                                        .button(li(Icon::FlaskConical))
+                                        .on_hover_text("Test connection")
+                                        .clicked()
+                                    {
                                         test = Some(p.name.clone());
                                     }
                                 },
@@ -1350,7 +1528,10 @@ impl eframe::App for SuperAiApp {
                         ui.label(egui::RichText::new("No providers yet").weak());
                     }
                     ui.separator();
-                    ui.heading("Add / update provider");
+                    ui.horizontal(|ui| {
+                        ui.label(li(Icon::Plus).strong());
+                        ui.heading("Add / update provider");
+                    });
                     ui.horizontal(|ui| {
                         ui.label("Name");
                         ui.add(
@@ -1363,7 +1544,11 @@ impl eframe::App for SuperAiApp {
                             .selected_text(&self.prov_kind)
                             .show_ui(ui, |ui| {
                                 for k in KINDS {
-                                    ui.selectable_value(&mut self.prov_kind, k.to_string(), *k);
+                                    ui.selectable_value(
+                                        &mut self.prov_kind,
+                                        k.to_string(),
+                                        kind_label(k),
+                                    );
                                 }
                             });
                     });
@@ -1382,9 +1567,38 @@ impl eframe::App for SuperAiApp {
                                 .hint_text("default model id")
                                 .desired_width(200.0),
                         );
-                        let hints = model_hints(&self.prov_kind).join(", ");
-                        if !hints.is_empty() {
-                            ui.label(egui::RichText::new(format!("try: {hints}")).small().weak());
+                    });
+                    if !model_hints(&self.prov_kind).is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("try:").small().weak());
+                            let mut pick: Option<String> = None;
+                            for h in model_hints(&self.prov_kind) {
+                                if ui.button(*h).clicked() {
+                                    pick = Some(h.to_string());
+                                }
+                            }
+                            if let Some(h) = pick {
+                                self.prov_model = h;
+                            }
+                        });
+                    }
+                    egui::CollapsingHeader::new("Model catalog").show(ui, |ui| {
+                        for m in known_models(&self.prov_kind) {
+                            ui.horizontal(|ui| {
+                                ui.label(li(Icon::Cpu).small().weak());
+                                ui.label(egui::RichText::new(&m.display_name).strong());
+                                ui.label(egui::RichText::new(&m.id).small().monospace());
+                            });
+                            ui.label(egui::RichText::new(catalog_line(&m)).small().weak());
+                        }
+                        if known_models(&self.prov_kind).is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No offline catalog — use an id from the server's /v1/models.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1503,6 +1717,16 @@ fn main() -> eframe::Result<()> {
         "Super-AI",
         options,
         Box::new(|cc| {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "lucide".to_owned(),
+                egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+            );
+            fonts.families.insert(
+                egui::FontFamily::Name("lucide".into()),
+                vec!["lucide".to_owned()],
+            );
+            cc.egui_ctx.set_fonts(fonts);
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(SuperAiApp::new(
                 db, policy, agent, handle, ui_tx, ui_rx,

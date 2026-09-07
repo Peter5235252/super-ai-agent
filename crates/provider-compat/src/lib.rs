@@ -93,7 +93,7 @@ impl CompatProvider {
             base_url,
             default_model,
             GEMINI_BASE_URL,
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             ProviderKind::Google,
             models::known_models_gemini,
         )
@@ -650,7 +650,8 @@ mod tests {
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert!(gemini.contains(&"gemini-3-pro".to_string()));
+        assert!(gemini.contains(&"gemini-3.8-flash".to_string()));
+        assert!(gemini.contains(&"gemini-3.1-pro-preview".to_string()));
         let ollama: Vec<String> = models::known_models_ollama()
             .into_iter()
             .map(|m| m.id)

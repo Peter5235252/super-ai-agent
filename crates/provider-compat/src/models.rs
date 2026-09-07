@@ -101,57 +101,73 @@ pub fn resolve_mistral(id: &str) -> ModelInfo {
 // Gemini (via Google's OpenAI-compat shim)
 // ---------------------------------------------------------------------------
 
-/// Known Gemini models; confirm exact versioned IDs in Google AI Studio —
-/// Google revises them on its own cadence.
+/// Known Gemini models (September 2026); confirm exact versioned IDs in
+/// Google AI Studio — Google revises them on its own cadence.
 pub fn known_models_gemini() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
-            id: "gemini-3-pro".into(),
+            id: "gemini-3.8-flash".into(),
             provider: ProviderKind::Google,
-            display_name: "Gemini 3 Pro".into(),
+            display_name: "Gemini 3.8 Flash".into(),
             capabilities: caps(true),
-            context_window: None,
-            max_output_tokens: None,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
-            knowledge_cutoff: None,
-            notes: Some("Frontier reasoning model; confirm exact id in Google docs.".into()),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+            input_price_per_mtok: Some(0.75),
+            output_price_per_mtok: Some(3.75),
+            knowledge_cutoff: Some("Mar 2026".into()),
+            notes: Some(
+                "Newest Flash (Sep 2, 2026); best for coding/agents. Intro rate through \
+                 Dec 31, 2026."
+                    .into(),
+            ),
         },
         ModelInfo {
-            id: "gemini-3-flash".into(),
+            id: "gemini-3.7-flash".into(),
             provider: ProviderKind::Google,
-            display_name: "Gemini 3 Flash".into(),
+            display_name: "Gemini 3.7 Flash".into(),
             capabilities: caps(true),
             context_window: None,
             max_output_tokens: None,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
+            input_price_per_mtok: Some(0.75),
+            output_price_per_mtok: Some(3.75),
             knowledge_cutoff: None,
-            notes: Some("Fast/cheap reasoning tier; confirm exact id in Google docs.".into()),
+            notes: Some(
+                "Previous Flash (Aug 2026); same intro rate through Dec 31, 2026. Confirm \
+                 specs in AI Studio."
+                    .into(),
+            ),
         },
         ModelInfo {
-            id: "gemini-2.5-pro".into(),
+            id: "gemini-3.6-flash".into(),
             provider: ProviderKind::Google,
-            display_name: "Gemini 2.5 Pro".into(),
+            display_name: "Gemini 3.6 Flash".into(),
             capabilities: caps(true),
             context_window: None,
             max_output_tokens: None,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
+            input_price_per_mtok: Some(0.75),
+            output_price_per_mtok: Some(3.75),
             knowledge_cutoff: None,
-            notes: Some("Previous-gen pro; long-context workhorse.".into()),
+            notes: Some(
+                "July 2026 Flash; same intro rate through Dec 31, 2026. Confirm specs in \
+                 AI Studio."
+                    .into(),
+            ),
         },
         ModelInfo {
-            id: "gemini-2.5-flash".into(),
+            id: "gemini-3.1-pro-preview".into(),
             provider: ProviderKind::Google,
-            display_name: "Gemini 2.5 Flash".into(),
+            display_name: "Gemini 3.1 Pro".into(),
             capabilities: caps(true),
-            context_window: None,
-            max_output_tokens: None,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
-            knowledge_cutoff: None,
-            notes: Some("High-volume extraction/summarization tier.".into()),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+            input_price_per_mtok: Some(2.5),
+            output_price_per_mtok: Some(15.0),
+            knowledge_cutoff: Some("Jan 2025".into()),
+            notes: Some(
+                "Flagship reasoning (Feb 2026); paid tier only. Confirm id/pricing in AI \
+                 Studio."
+                    .into(),
+            ),
         },
     ]
 }

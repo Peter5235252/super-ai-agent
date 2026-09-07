@@ -1,7 +1,8 @@
-//! xAI (Grok) provider adapter.
+//! SpaceXAI (Grok) provider adapter.
 //!
 //! Grok exposes the OpenAI-compatible Responses API, so this crate reuses
-//! `provider-openai`'s streaming client with xAI's endpoint and model table.
+//! `provider-openai`'s streaming client with SpaceXAI's endpoint and model
+//! table. (xAI rebranded as SpaceXAI in July 2026; the API is unchanged.)
 #![forbid(unsafe_code)]
 
 pub mod models;
@@ -60,5 +61,9 @@ mod tests {
         assert!(m.capabilities.web_search);
         assert_eq!(m.input_price_per_mtok, Some(2.0));
         assert_eq!(m.output_price_per_mtok, Some(6.0));
+        let ids: Vec<String> = models::known_models().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"grok-4.5".to_string()));
+        assert!(ids.contains(&"grok-4.3".to_string()));
+        assert!(ids.contains(&"grok-build-0.1".to_string()));
     }
 }
