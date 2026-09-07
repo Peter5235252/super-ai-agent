@@ -5,7 +5,7 @@
 
 pub mod models;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,7 +74,10 @@ impl AnthropicProvider {
 
     async fn stream_response(&self, request: &AgentRequest) -> Result<ProviderEventStream> {
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
-        let (system, messages) = build_messages(&request.messages);
+        let (history_system, messages) = build_messages(&request.messages);
+        // The agent carries the system prompt separately from history; both
+        // must reach the API or the model loses its instructions and tools.
+        let system = merge_system(request.system.as_deref(), history_system);
         let model = if request.model.is_empty() {
             self.default_model.as_str()
         } else {
@@ -148,6 +151,8 @@ struct AnthState {
     usage_out: u64,
     /// index -> (tool_use_id, name, accumulated partial JSON)
     blocks: BTreeMap<usize, (String, String, String)>,
+    /// content-block indexes currently streaming chain-of-thought
+    thinking: BTreeSet<usize>,
 }
 
 fn map_anth_event(state: &mut AnthState, ev: SseEvent) -> Vec<ProviderEvent> {
@@ -168,21 +173,28 @@ fn map_anth_event(state: &mut AnthState, ev: SseEvent) -> Vec<ProviderEvent> {
         }
         "content_block_start" => {
             let index = data["index"].as_u64().unwrap_or(0) as usize;
-            if data["content_block"]["type"].as_str() == Some("tool_use") {
-                let id = data["content_block"]["id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let name = data["content_block"]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                state
-                    .blocks
-                    .insert(index, (id.clone(), name.clone(), String::new()));
-                vec![ProviderEvent::ToolCallStart { index, id, name }]
-            } else {
-                vec![]
+            match data["content_block"]["type"].as_str() {
+                Some("tool_use") => {
+                    let id = data["content_block"]["id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let name = data["content_block"]["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    state
+                        .blocks
+                        .insert(index, (id.clone(), name.clone(), String::new()));
+                    vec![ProviderEvent::ToolCallStart { index, id, name }]
+                }
+                // Thinking / redacted-thinking blocks carry the model's
+                // chain-of-thought; surfaced as reasoning, never as chat.
+                Some("thinking") | Some("redacted_thinking") => {
+                    state.thinking.insert(index);
+                    vec![]
+                }
+                _ => vec![],
             }
         }
         "content_block_delta" => {
@@ -205,11 +217,28 @@ fn map_anth_event(state: &mut AnthState, ev: SseEvent) -> Vec<ProviderEvent> {
                     }
                     vec![]
                 }
+                Some("thinking_delta") => {
+                    if !state.thinking.contains(&index) {
+                        vec![]
+                    } else {
+                        data["delta"]["thinking"]
+                            .as_str()
+                            .filter(|t| !t.is_empty())
+                            .map(|t| {
+                                vec![ProviderEvent::ReasoningDelta {
+                                    text: t.to_string(),
+                                }]
+                            })
+                            .unwrap_or_default()
+                    }
+                }
+                Some("signature_delta") => vec![],
                 _ => vec![],
             }
         }
         "content_block_stop" => {
             let index = data["index"].as_u64().unwrap_or(0) as usize;
+            state.thinking.remove(&index);
             if let Some((_id, _name, args)) = state.blocks.remove(&index) {
                 let arguments = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
                 vec![ProviderEvent::ToolCallEnd { index, arguments }]
@@ -237,6 +266,19 @@ fn map_anth_event(state: &mut AnthState, ev: SseEvent) -> Vec<ProviderEvent> {
             vec![ProviderEvent::Error { message }]
         }
         _ => vec![],
+    }
+}
+
+/// Merge the request-level system prompt with any system messages found
+/// in history. Either side may be absent; both are kept when present.
+fn merge_system(request: Option<&str>, history: Option<String>) -> Option<String> {
+    match (
+        request.filter(|s| !s.is_empty()),
+        history.filter(|s| !s.is_empty()),
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, b) => b,
     }
 }
 
@@ -338,6 +380,47 @@ mod tests {
         assert!(ids.iter().any(|id| id == "claude-fable-5-1"));
         assert!(ids.iter().any(|id| id == "claude-opus-5"));
         assert!(ids.iter().any(|id| id == "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn request_system_prompt_survives() {
+        assert_eq!(merge_system(Some("a"), None).as_deref(), Some("a"));
+        assert_eq!(merge_system(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(
+            merge_system(Some("a"), Some("b".into())).as_deref(),
+            Some("a\n\nb")
+        );
+        assert_eq!(merge_system(Some(""), None), None);
+        assert_eq!(merge_system(None, None), None);
+    }
+
+    #[test]
+    fn thinking_blocks_become_reasoning() {
+        use provider_api::sse::SseEvent;
+        let mut state = AnthState::default();
+        let ev = |data: &str| SseEvent {
+            event: None,
+            data: data.to_string(),
+        };
+        let start = map_anth_event(
+            &mut state,
+            ev(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#),
+        );
+        assert!(start.is_empty());
+        let delta = map_anth_event(
+            &mut state,
+            ev(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}"#),
+        );
+        assert!(matches!(
+            &delta[0],
+            ProviderEvent::ReasoningDelta { text } if text == "let me think"
+        ));
+        // Plain text deltas still map to chat text.
+        let text = map_anth_event(
+            &mut state,
+            ev(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#),
+        );
+        assert!(matches!(&text[0], ProviderEvent::TextDelta { .. }));
     }
 
     #[test]

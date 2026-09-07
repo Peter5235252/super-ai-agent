@@ -8,6 +8,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
+mod md;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -117,6 +119,31 @@ fn kind_label(kind: &str) -> &'static str {
     }
 }
 
+/// Plain-language blurbs so non-technical users can pick a kind.
+fn kind_blurb(kind: &str) -> &'static str {
+    match kind {
+        "openai" => "ChatGPT models. Needs an OpenAI API key.",
+        "anthropic" => "Claude models. Needs an Anthropic API key.",
+        "xai" => "Grok models by SpaceXAI. Needs an xAI API key.",
+        "mistral" => "Mistral + Codestral. Needs a La Plateforme API key.",
+        "gemini" => "Google Gemini. Needs a Google AI Studio key.",
+        "ollama" => "Free models on your own PC via Ollama. No key — install Ollama and pull a model first.",
+        "local" => "LM Studio, vLLM or llama.cpp server. No key — enter its address below.",
+        _ => "",
+    }
+}
+
+/// Default server address, if the kind has one well-known value.
+fn default_base_url(kind: &str) -> Option<&'static str> {
+    match kind {
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+        "ollama" => Some("http://localhost:11434/v1"),
+        "local" => Some("http://localhost:1234/v1"),
+        _ => None,
+    }
+}
+
 /// One Lucide glyph in the bundled icon font.
 fn li(ic: Icon) -> egui::RichText {
     egui::RichText::new(char::from(ic).to_string()).family(egui::FontFamily::Name("lucide".into()))
@@ -159,6 +186,10 @@ enum UiUpdate {
     Agent(AgentEvent),
     SendFailed(String),
     SessionGone(Uuid),
+    ModelList {
+        provider: String,
+        models: Vec<ModelInfo>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +199,8 @@ enum UiUpdate {
 struct UiMsg {
     role: &'static str,
     content: String,
+    /// The model's private reasoning for assistant turns (may be empty).
+    reasoning: String,
 }
 
 struct ActivityItem {
@@ -197,6 +230,12 @@ struct SuperAiApp {
     stream: String,
     stream_task: Option<Uuid>,
     streaming: bool,
+    /// Live chain-of-thought for the streaming turn (visible "Thinking").
+    stream_reasoning: String,
+    stream_reasoning_task: Option<Uuid>,
+    /// Last time any agent event arrived; guards against a stuck spinner
+    /// if a terminal event is ever lost.
+    last_agent_event: Option<std::time::Instant>,
     activity: Vec<ActivityItem>,
     approvals: Vec<ApprovalCard>,
     providers: Vec<ProviderRow>,
@@ -211,6 +250,12 @@ struct SuperAiApp {
     provider_sel: String,
     model_sel: String,
     send_requested: bool,
+    /// Guided model browser (friendly names, prices, live list).
+    show_models: bool,
+    browser_provider: String,
+    browser_models: Vec<ModelInfo>,
+    browser_loading: bool,
+    browser_custom: String,
 
     prov_name: String,
     prov_kind: String,
@@ -242,6 +287,9 @@ impl SuperAiApp {
             stream: String::new(),
             stream_task: None,
             streaming: false,
+            stream_reasoning: String::new(),
+            stream_reasoning_task: None,
+            last_agent_event: None,
             activity: Vec::new(),
             approvals: Vec::new(),
             providers: Vec::new(),
@@ -255,6 +303,11 @@ impl SuperAiApp {
             provider_sel: String::new(),
             model_sel: String::new(),
             send_requested: false,
+            show_models: false,
+            browser_provider: String::new(),
+            browser_models: Vec::new(),
+            browser_loading: false,
+            browser_custom: String::new(),
             prov_name: String::new(),
             prov_kind: "openai".to_string(),
             prov_base: String::new(),
@@ -342,6 +395,8 @@ impl SuperAiApp {
         self.stream.clear();
         self.streaming = false;
         self.stream_task = None;
+        self.stream_reasoning.clear();
+        self.stream_reasoning_task = None;
         self.approvals.clear();
         self.activity.clear();
         self.messages.clear();
@@ -410,13 +465,34 @@ impl SuperAiApp {
             return;
         };
         let text = self.draft.trim().to_string();
-        if text.is_empty() || self.streaming {
+        if text.is_empty() {
             return;
+        }
+        // Watchdog: if a previous task's terminal event was ever lost, the
+        // spinner would stick forever and every send would be swallowed.
+        // After 5 silent minutes, assume the task is gone and start fresh.
+        if self.streaming {
+            let silent = self
+                .last_agent_event
+                .map(|t| t.elapsed() > std::time::Duration::from_secs(300))
+                .unwrap_or(true);
+            if silent {
+                self.streaming = false;
+                self.stream.clear();
+                self.stream_reasoning.clear();
+                self.notice = Some(
+                    "The previous task went quiet, so I cleared it. Trying your message now."
+                        .to_string(),
+                );
+            } else {
+                return;
+            }
         }
         self.draft.clear();
         self.messages.push(UiMsg {
             role: "user",
             content: text.clone(),
+            reasoning: String::new(),
         });
 
         let db = self.db.clone();
@@ -581,6 +657,59 @@ impl SuperAiApp {
         });
     }
 
+    /// Open the guided model browser for the currently picked provider.
+    fn open_models(&mut self) {
+        if self.browser_provider.is_empty() {
+            self.browser_provider = if !self.provider_sel.is_empty() {
+                self.provider_sel.clone()
+            } else {
+                self.providers.first().map(|p| p.name.clone()).unwrap_or_default()
+            };
+        }
+        self.show_models = true;
+        self.reload_browser();
+    }
+
+    /// (Re)load the model list: live from the server, built-in catalog
+    /// as fallback. Never blocks the UI.
+    fn reload_browser(&mut self) {
+        let name = self.browser_provider.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.browser_loading = true;
+        self.browser_models.clear();
+        let db = self.db.clone();
+        let tx = self.tx.clone();
+        self.spawn(async move {
+            let err = match load_models_inner(&db, &name).await {
+                Ok(models) => {
+                    let _ = tx.send(UiUpdate::ModelList {
+                        provider: name,
+                        models,
+                    });
+                    return;
+                }
+                Err(e) => e,
+            };
+            // Fallback: built-in catalog so picking still works offline.
+            let kind = db
+                .get_provider(&name)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.kind)
+                .unwrap_or_default();
+            let _ = tx.send(UiUpdate::ModelList {
+                provider: name.clone(),
+                models: known_models(&kind),
+            });
+            let _ = tx.send(UiUpdate::Notice(format!(
+                "Live model list failed ({err}); showing built-in catalog."
+            )));
+        });
+    }
+
     fn answer_approval(&mut self, id: Uuid, allow: bool) {
         self.approvals.retain(|c| c.approval_id != id);
         let policy = self.policy.clone();
@@ -622,6 +751,7 @@ impl SuperAiApp {
                                     "assistant"
                                 },
                                 content: r.content.clone(),
+                                reasoning: r.reasoning.clone().unwrap_or_default(),
                             })
                             .collect();
                     }
@@ -630,7 +760,8 @@ impl SuperAiApp {
                 UiUpdate::Keys(keys) => self.keys = keys,
                 UiUpdate::ProviderTested(msg) => self.prov_result = Some(msg),
                 UiUpdate::SendFailed(e) => {
-                    self.push_activity("err", e);
+                    self.push_activity("err", e.clone());
+                    self.notice = Some(e);
                     self.streaming = false;
                 }
                 UiUpdate::SessionGone(id) => {
@@ -646,14 +777,22 @@ impl SuperAiApp {
                     }
                 }
                 UiUpdate::Agent(ev) => self.apply_event(ev),
+                UiUpdate::ModelList { provider, models } => {
+                    if provider == self.browser_provider {
+                        self.browser_models = models;
+                        self.browser_loading = false;
+                    }
+                }
             }
         }
     }
 
     fn apply_event(&mut self, ev: AgentEvent) {
+        self.last_agent_event = Some(std::time::Instant::now());
         match ev {
             AgentEvent::TaskCreated { task_id, .. } => {
                 self.stream_task = Some(task_id);
+                self.stream_reasoning_task = Some(task_id);
                 self.streaming = true;
             }
             AgentEvent::ModelDelta { task_id, text, .. } => {
@@ -661,12 +800,21 @@ impl SuperAiApp {
                     self.stream.push_str(&text);
                 }
             }
-            AgentEvent::MessageCompleted { text, .. } => {
+            AgentEvent::ReasoningDelta { task_id, text, .. } => {
+                if self.stream_reasoning_task == Some(task_id) {
+                    self.stream_reasoning.push_str(&text);
+                }
+            }
+            AgentEvent::MessageCompleted {
+                text, reasoning, ..
+            } => {
                 self.messages.push(UiMsg {
                     role: "assistant",
                     content: text,
+                    reasoning,
                 });
                 self.stream.clear();
+                self.stream_reasoning.clear();
             }
             AgentEvent::ToolRequested { tool, args, .. } => {
                 let arg_str = serde_json::to_string(&args).unwrap_or_default();
@@ -706,9 +854,20 @@ impl SuperAiApp {
                 );
                 self.last_summary = Some(summary);
                 self.streaming = false;
+                self.stream_reasoning.clear();
             }
             AgentEvent::TaskFailed { error, .. } => {
-                self.push_activity("err", error);
+                self.push_activity("err", error.clone());
+                // Loud failure: non-technical users never open the Activity
+                // panel, so the error must surface in the conversation itself.
+                self.messages.push(UiMsg {
+                    role: "assistant",
+                    content: format!("I ran into a problem and stopped:\n\n{error}"),
+                    reasoning: String::new(),
+                });
+                self.notice = Some(error);
+                self.stream.clear();
+                self.stream_reasoning.clear();
                 self.streaming = false;
             }
             _ => {}
@@ -740,6 +899,21 @@ fn catalog_line(m: &ModelInfo) -> String {
     } else {
         parts.join(" · ")
     }
+}
+
+/// Human-friendly label for a bound model: the catalog display name when
+/// the id is known, otherwise the raw id.
+fn friendly_model(providers: &[ProviderRow], provider: &str, model: &str) -> String {
+    let kind = providers
+        .iter()
+        .find(|p| p.name == provider)
+        .map(|p| p.kind.as_str())
+        .unwrap_or("");
+    known_models(kind)
+        .into_iter()
+        .find(|m| m.id == model)
+        .map(|m| m.display_name)
+        .unwrap_or_else(|| model.to_string())
 }
 
 fn none_if_empty(s: &str) -> Option<String> {
@@ -840,7 +1014,10 @@ fn known_models(kind: &str) -> Vec<ModelInfo> {
     }
 }
 
-async fn test_provider_inner(db: &Db, name: &str) -> Result<String, String> {
+async fn provider_for(
+    db: &Db,
+    name: &str,
+) -> Result<(Arc<dyn ModelProvider>, ProviderRow), String> {
     let row = db
         .get_provider(name)
         .await
@@ -858,6 +1035,16 @@ async fn test_provider_inner(db: &Db, name: &str) -> Result<String, String> {
         key,
         row.default_model.clone(),
     )?;
+    Ok((provider, row))
+}
+
+async fn load_models_inner(db: &Db, name: &str) -> Result<Vec<ModelInfo>, String> {
+    let (provider, _) = provider_for(db, name).await?;
+    provider.list_models().await.map_err(|e| format!("{e}"))
+}
+
+async fn test_provider_inner(db: &Db, name: &str) -> Result<String, String> {
+    let (provider, row) = provider_for(db, name).await?;
     match provider.list_models().await {
         Ok(models) => {
             if models.is_empty() {
@@ -988,6 +1175,7 @@ async fn send_message_inner(
         content: text.clone(),
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
         created_at: now_ms(),
     })
     .await
@@ -1045,6 +1233,7 @@ fn event_kind(ev: &AgentEvent) -> &'static str {
         AgentEvent::TaskCreated { .. } => "task_created",
         AgentEvent::ReasoningStarted { .. } => "reasoning_started",
         AgentEvent::ModelDelta { .. } => "model_delta",
+        AgentEvent::ReasoningDelta { .. } => "reasoning_delta",
         AgentEvent::ToolRequested { .. } => "tool_requested",
         AgentEvent::ToolStarted { .. } => "tool_started",
         AgentEvent::ToolOutput { .. } => "tool_output",
@@ -1068,6 +1257,11 @@ fn event_ids(ev: &AgentEvent) -> (Option<Uuid>, Option<Uuid>) {
             session_id,
         }
         | AgentEvent::ModelDelta {
+            task_id,
+            session_id,
+            ..
+        }
+        | AgentEvent::ReasoningDelta {
             task_id,
             session_id,
             ..
@@ -1116,6 +1310,15 @@ fn event_ids(ev: &AgentEvent) -> (Option<Uuid>, Option<Uuid>) {
 }
 
 async fn persist_event(db: &Db, ev: &AgentEvent) {
+    // Token deltas stream to the UI live; writing every one to SQLite would
+    // drown the flight recorder (and stall the event bus). Everything else
+    // is persisted.
+    if matches!(
+        ev,
+        AgentEvent::ModelDelta { .. } | AgentEvent::ReasoningDelta { .. }
+    ) {
+        return;
+    }
     let payload = match serde_json::to_value(ev) {
         Ok(p) => p,
         Err(_) => return,
@@ -1124,21 +1327,60 @@ async fn persist_event(db: &Db, ev: &AgentEvent) {
     let _ = db
         .insert_event(task_id, session_id, event_kind(ev), &payload)
         .await;
-    if let AgentEvent::MessageCompleted {
-        session_id, text, ..
-    } = ev
-    {
-        let _ = db
-            .insert_message(&MessageRow {
-                id: Uuid::new_v4(),
-                session_id: *session_id,
-                role: "assistant".into(),
-                content: text.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                created_at: now_ms(),
-            })
-            .await;
+    // Mirror the conversation into `messages` so the next turn reloads a
+    // complete, correctly paired history (assistant tool_calls + tool
+    // results). Without this, providers reject follow-up requests.
+    match ev {
+        AgentEvent::MessageCompleted {
+            session_id,
+            text,
+            reasoning,
+            tool_calls,
+            ..
+        } => {
+            let tool_calls = if tool_calls.is_empty() {
+                None
+            } else {
+                serde_json::to_string(tool_calls).ok()
+            };
+            let reasoning = if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning.clone())
+            };
+            let _ = db
+                .insert_message(&MessageRow {
+                    id: Uuid::new_v4(),
+                    session_id: *session_id,
+                    role: "assistant".into(),
+                    content: text.clone(),
+                    tool_calls,
+                    tool_call_id: None,
+                    reasoning,
+                    created_at: now_ms(),
+                })
+                .await;
+        }
+        AgentEvent::ToolOutput {
+            session_id,
+            tool_call_id,
+            output,
+            ..
+        } => {
+            let _ = db
+                .insert_message(&MessageRow {
+                    id: Uuid::new_v4(),
+                    session_id: *session_id,
+                    role: "tool".into(),
+                    content: output.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_call_id.clone()),
+                    reasoning: None,
+                    created_at: now_ms(),
+                })
+                .await;
+        }
+        _ => {}
     }
     if let Some(sid) = session_id {
         let _ = db.touch_session(sid).await;
@@ -1185,11 +1427,23 @@ impl eframe::App for SuperAiApp {
                         {
                             self.apply_binding();
                         }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.model_sel)
-                                .hint_text("model")
-                                .desired_width(170.0),
-                        );
+                        // Guided picker instead of a raw model id: friendly
+                        // names, prices, live server list. Custom ids still
+                        // work via the picker's "Custom" field. Binding can
+                        // change any time, even mid-conversation — history
+                        // is kept, the next answer uses the new model.
+                        let model_label = if self.model_sel.trim().is_empty() {
+                            "Choose model…".to_string()
+                        } else {
+                            friendly_model(&self.providers, &self.provider_sel, &self.model_sel)
+                        };
+                        if ui
+                            .button(model_label)
+                            .on_hover_text("Pick a model (changeable any time)")
+                            .clicked()
+                        {
+                            self.open_models();
+                        }
                         egui::ComboBox::from_id_salt("bind_provider")
                             .selected_text(if self.provider_sel.is_empty() {
                                 "provider…"
@@ -1393,46 +1647,129 @@ impl eframe::App for SuperAiApp {
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if self.messages.is_empty() && self.stream.is_empty() {
+                    if active.is_none() {
+                        // First-run guide for non-technical users.
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            ui.label(li(Icon::Bot).size(22.0).strong());
+                            ui.heading("Welcome to Super-AI");
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Your AI assistant for files and terminal tasks. Three steps:",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(li(Icon::KeyRound).strong());
+                                ui.label(egui::RichText::new("1. Add a provider").strong());
+                            });
+                            ui.label(
+                                "Pick ChatGPT, Claude, Grok, Mistral, Gemini — or run free \
+                                 local models with Ollama. Keys stay in Windows Credential Manager.",
+                            );
+                            if ui.button("Open Providers & keys").clicked() {
+                                self.show_providers = true;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(li(Icon::MessageSquare).strong());
+                                ui.label(egui::RichText::new("2. Create a session").strong());
+                            });
+                            ui.label(
+                                "Optionally type a folder path in the sidebar so the AI can \
+                                 work with your files, then press New session.",
+                            );
+                            if ui.button("New session").clicked() {
+                                self.create_session();
+                            }
+                        });
+                        ui.add_space(6.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(li(Icon::Bot).strong());
+                                ui.label(
+                                    egui::RichText::new("3. Choose a model and chat").strong(),
+                                );
+                            });
+                            ui.label(
+                                "Use the provider + model controls at the top (changeable any \
+                                 time, even mid-conversation), then ask for something.",
+                            );
+                        });
+                    } else if self.messages.is_empty() && self.stream.is_empty() {
                         ui.add_space(20.0);
                         ui.label(
                             egui::RichText::new(
-                                "Open a workspace, bind a provider, and ask the agent to do something.\n\
+                                "Pick a provider and press \"Choose model…\" above if you \
+                                 haven't yet — then ask the agent to do something.\n\
                                  It can read/write files and run terminal commands (approvals required).",
                             )
                             .weak(),
                         );
                     }
-                    for m in &self.messages {
+                    for (idx, m) in self.messages.iter().enumerate() {
                         ui.add_space(6.0);
                         let (ic, head, color) = if m.role == "user" {
                             (Icon::User, "you", egui::Color32::LIGHT_BLUE)
                         } else {
                             (Icon::Bot, "assistant", egui::Color32::LIGHT_GREEN)
                         };
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(li(ic).color(color));
-                                ui.label(
-                                    egui::RichText::new(head).small().strong().color(color),
-                                );
+                        ui.push_id(format!("msg-{idx}"), |ui| {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(li(ic).color(color));
+                                    ui.label(
+                                        egui::RichText::new(head).small().strong().color(color),
+                                    );
+                                });
+                                if !m.reasoning.is_empty() {
+                                    egui::CollapsingHeader::new("Thinking")
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&m.reasoning)
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        });
+                                }
+                                md::show(ui, &format!("msg-{idx}"), &m.content);
                             });
-                            ui.label(m.content.as_str());
                         });
                     }
-                    if !self.stream.is_empty() {
+                    if !self.stream.is_empty() || !self.stream_reasoning.is_empty() {
                         ui.add_space(6.0);
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(li(Icon::Bot).color(egui::Color32::LIGHT_GREEN));
-                                ui.label(
-                                    egui::RichText::new("assistant · streaming")
-                                        .small()
-                                        .strong()
-                                        .color(egui::Color32::LIGHT_GREEN),
-                                );
+                        ui.push_id("streaming", |ui| {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(li(Icon::Bot).color(egui::Color32::LIGHT_GREEN));
+                                    ui.label(
+                                        egui::RichText::new("assistant · streaming")
+                                            .small()
+                                            .strong()
+                                            .color(egui::Color32::LIGHT_GREEN),
+                                    );
+                                });
+                                if !self.stream_reasoning.is_empty() {
+                                    egui::CollapsingHeader::new("Thinking")
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&self.stream_reasoning)
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        });
+                                }
+                                if !self.stream.is_empty() {
+                                    md::show(ui, "streaming", &format!("{}▍", self.stream));
+                                }
                             });
-                            ui.label(format!("{}▍", self.stream));
                         });
                     }
                 });
@@ -1582,13 +1919,24 @@ impl eframe::App for SuperAiApp {
                                 }
                             });
                     });
+                    ui.label(
+                        egui::RichText::new(kind_blurb(&self.prov_kind))
+                            .small()
+                            .weak(),
+                    );
                     ui.horizontal(|ui| {
                         ui.label("Base URL");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.prov_base)
                                 .hint_text(base_placeholder(&self.prov_kind))
-                                .desired_width(380.0),
+                                .desired_width(300.0),
                         );
+                        if default_base_url(&self.prov_kind).is_some()
+                            && ui.button("Fill default").clicked()
+                        {
+                            self.prov_base =
+                                default_base_url(&self.prov_kind).unwrap_or_default().to_string();
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Model");
@@ -1660,6 +2008,112 @@ impl eframe::App for SuperAiApp {
             self.show_providers = open;
         }
 
+        // -- guided model browser -------------------------------------------
+        if self.show_models {
+            let mut open = self.show_models;
+            egui::Window::new("Choose a model")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(580.0)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Friendly names, prices and context. Live list when the server \
+                             is reachable, built-in catalog otherwise. You can switch models \
+                             any time — even mid-conversation; history is kept.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Provider");
+                        let before = self.browser_provider.clone();
+                        egui::ComboBox::from_id_salt("browser_provider")
+                            .selected_text(if self.browser_provider.is_empty() {
+                                "pick…"
+                            } else {
+                                &self.browser_provider
+                            })
+                            .show_ui(ui, |ui| {
+                                for p in &self.providers {
+                                    ui.selectable_value(
+                                        &mut self.browser_provider,
+                                        p.name.clone(),
+                                        format!("{} ({})", p.name, kind_label(&p.kind)),
+                                    );
+                                }
+                            });
+                        if self.browser_provider != before {
+                            self.reload_browser();
+                        }
+                        if ui
+                            .button(li(Icon::RefreshCw))
+                            .on_hover_text("Reload live model list")
+                            .clicked()
+                        {
+                            self.reload_browser();
+                        }
+                    });
+                    if self.browser_provider.is_empty() {
+                        ui.label("Add a provider first (Providers & keys).");
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.browser_custom)
+                                    .hint_text("Or type any model id…")
+                                    .desired_width(300.0),
+                            );
+                            if ui.button("Use custom id").clicked()
+                                && !self.browser_custom.trim().is_empty()
+                            {
+                                self.model_sel = self.browser_custom.trim().to_string();
+                                self.browser_custom.clear();
+                                self.show_models = false;
+                            }
+                        });
+                        if self.browser_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Loading live model list…");
+                            });
+                        }
+                        let mut pick: Option<String> = None;
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for m in self.browser_models.clone() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(li(Icon::Cpu).small().weak());
+                                        if ui.button(&m.display_name).clicked() {
+                                            pick = Some(m.id.clone());
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(&m.id).small().monospace(),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(catalog_line(&m)).small().weak(),
+                                    );
+                                }
+                                if !self.browser_loading && self.browser_models.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No models found. Check the provider setup, \
+                                             or type a custom id above.",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                            });
+                        if let Some(id) = pick {
+                            self.model_sel = id;
+                            self.show_models = false;
+                        }
+                    }
+                });
+            self.show_models = open;
+        }
+
         if self.send_requested {
             self.send_requested = false;
             self.do_send();
@@ -1707,7 +2161,7 @@ fn main() -> eframe::Result<()> {
     let handle = rt.handle().clone();
 
     let policy = PolicyEngine::new(RiskClass::Low);
-    let (bus_tx, _bus_rx) = broadcast::channel::<AgentEvent>(1024);
+    let (bus_tx, _bus_rx) = broadcast::channel::<AgentEvent>(4096);
     let agent = Agent::new(policy.clone(), bus_tx.clone());
 
     // Single global forwarder: every agent event is persisted (flight
@@ -1788,6 +2242,7 @@ mod tests {
             Icon::Activity,
             Icon::Cpu,
             Icon::Send,
+            Icon::RefreshCw,
         ];
         let mut missing = Vec::new();
         for ic in used {
@@ -1834,6 +2289,7 @@ mod tests {
             Icon::Activity,
             Icon::Cpu,
             Icon::Send,
+            Icon::RefreshCw,
         ];
         let mut missing = Vec::new();
         for ic in used {

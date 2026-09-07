@@ -45,6 +45,8 @@ pub struct MessageRow {
     pub content: String,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
+    /// The model's private reasoning for assistant turns (UI only).
+    pub reasoning: Option<String>,
     pub created_at: i64,
 }
 
@@ -190,8 +192,8 @@ impl Db {
 
     pub async fn insert_message(&self, row: &MessageRow) -> Result<()> {
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, reasoning, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(row.id)
         .bind(row.session_id)
@@ -199,6 +201,7 @@ impl Db {
         .bind(&row.content)
         .bind(&row.tool_calls)
         .bind(&row.tool_call_id)
+        .bind(&row.reasoning)
         .bind(row.created_at)
         .execute(&self.pool)
         .await?;
@@ -350,6 +353,7 @@ mod tests {
             content: "hello".into(),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
             created_at: now_ms(),
         })
         .await
@@ -361,6 +365,59 @@ mod tests {
 
         let sessions = db.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_turn_roundtrip_keeps_pairing() {
+        // A full agent turn (assistant tool_calls + tool results + reasoning)
+        // must reload intact, or providers reject the next request.
+        let db = Db::open_in_memory().await.unwrap();
+        let session_id = Uuid::new_v4();
+        db.create_session(session_id, "Tools", None).await.unwrap();
+
+        let mk = |role: &str,
+                  content: &str,
+                  tool_calls: Option<String>,
+                  tool_call_id: Option<String>,
+                  reasoning: Option<String>| MessageRow {
+            id: Uuid::new_v4(),
+            session_id,
+            role: role.into(),
+            content: content.into(),
+            tool_calls,
+            tool_call_id,
+            reasoning,
+            created_at: now_ms(),
+        };
+        db.insert_message(&mk("user", "list files", None, None, None))
+            .await
+            .unwrap();
+        db.insert_message(&mk(
+            "assistant",
+            "",
+            Some(r#"[{"id":"call_1","name":"fs.list","arguments":{"path":"."}}]"#.into()),
+            None,
+            Some("need file list first".into()),
+        ))
+        .await
+        .unwrap();
+        db.insert_message(&mk("tool", "a.txt", None, Some("call_1".into()), None))
+            .await
+            .unwrap();
+
+        let messages = db.list_messages(session_id).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        let assistant = &messages[1];
+        assert_eq!(assistant.role, "assistant");
+        assert!(assistant.tool_calls.as_deref().unwrap().contains("fs.list"));
+        assert_eq!(
+            assistant.reasoning.as_deref(),
+            Some("need file list first")
+        );
+        let tool = &messages[2];
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[tokio::test]

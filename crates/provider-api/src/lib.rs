@@ -237,6 +237,11 @@ pub enum ProviderEvent {
     TextDelta {
         text: String,
     },
+    /// The model's private chain-of-thought. Surfaced in the UI, never
+    /// fed back into conversation history.
+    ReasoningDelta {
+        text: String,
+    },
     ToolCallStart {
         index: usize,
         id: String,

@@ -317,6 +317,12 @@ struct CallAcc {
 struct StreamAcc {
     calls: BTreeMap<usize, CallAcc>,
     finished: bool,
+    /// Reasoning models (Qwen3, Magistral, …) stream `<think>…</think>`
+    /// inside the text channel. `in_think` tracks which side of the tags
+    /// we are on; `carry` holds a tag-sized tail that may complete a tag
+    /// split across chunks.
+    in_think: bool,
+    carry: String,
 }
 
 /// Map one SSE `data` payload (or `[DONE]`) to provider events.
@@ -346,12 +352,8 @@ fn map_chat_chunk(acc: &mut StreamAcc, data: &str) -> Vec<ProviderEvent> {
 
     // Streaming delta: text and/or tool-call fragments.
     let delta = &choice["delta"];
-    if let Some(text) = delta.get("content").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        out.push(ProviderEvent::TextDelta {
-            text: text.to_string(),
-        });
+    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        push_text(acc, text, &mut out);
     }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc in calls {
@@ -398,12 +400,8 @@ fn map_chat_chunk(acc: &mut StreamAcc, data: &str) -> Vec<ProviderEvent> {
     // `finish_reason: "stop"`.
     let message = &choice["message"];
     if message.is_object() {
-        if let Some(text) = message.get("content").and_then(Value::as_str)
-            && !text.is_empty()
-        {
-            out.push(ProviderEvent::TextDelta {
-                text: text.to_string(),
-            });
+        if let Some(text) = message.get("content").and_then(Value::as_str) {
+            push_text(acc, text, &mut out);
         }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for (pos, tc) in calls.iter().enumerate() {
@@ -492,6 +490,87 @@ fn parse_usage(chunk: &Value) -> Option<UsageEstimate> {
     })
 }
 
+/// Split streamed text on `<think>`/`</think>` reasoning tags.
+///
+/// Text outside the tags becomes `TextDelta`; text inside becomes
+/// `ReasoningDelta`. Tags split across chunks are reassembled via
+/// `acc.carry` (at most 7 chars are ever held back). A stray `</think>`
+/// without an opener is passed through as plain text.
+fn push_text(acc: &mut StreamAcc, frag: &str, out: &mut Vec<ProviderEvent>) {
+    if frag.is_empty() && acc.carry.is_empty() {
+        return;
+    }
+    let mut text = std::mem::take(&mut acc.carry);
+    text.push_str(frag);
+    let mut rest = text.as_str();
+    loop {
+        if acc.in_think {
+            match rest.find("</think>") {
+                Some(pos) => {
+                    let (inside, after) = rest.split_at(pos);
+                    if !inside.is_empty() {
+                        out.push(ProviderEvent::ReasoningDelta {
+                            text: inside.to_string(),
+                        });
+                    }
+                    acc.in_think = false;
+                    rest = &after["</think>".len()..];
+                }
+                None => {
+                    let hold = partial_tag_len(rest, "</think>");
+                    let (emit_now, hold_back) = rest.split_at(rest.len() - hold);
+                    if !emit_now.is_empty() {
+                        out.push(ProviderEvent::ReasoningDelta {
+                            text: emit_now.to_string(),
+                        });
+                    }
+                    acc.carry = hold_back.to_string();
+                    return;
+                }
+            }
+        } else {
+            match rest.find("<think>") {
+                Some(pos) => {
+                    let (outside, after) = rest.split_at(pos);
+                    if !outside.is_empty() {
+                        out.push(ProviderEvent::TextDelta {
+                            text: outside.to_string(),
+                        });
+                    }
+                    acc.in_think = true;
+                    rest = &after["<think>".len()..];
+                }
+                None => {
+                    let hold = partial_tag_len(rest, "<think>");
+                    let (emit_now, hold_back) = rest.split_at(rest.len() - hold);
+                    if !emit_now.is_empty() {
+                        out.push(ProviderEvent::TextDelta {
+                            text: emit_now.to_string(),
+                        });
+                    }
+                    acc.carry = hold_back.to_string();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Length of the longest trailing slice of `s` that could still grow into
+/// `tag` (e.g. `"ab<th"` vs `"<think>"` is 3). Byte-wise is safe: tags are
+/// pure ASCII, so any non-ASCII tail byte can never match a tag prefix.
+fn partial_tag_len(s: &str, tag: &str) -> usize {
+    let bytes = s.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    let max = bytes.len().min(tag_bytes.len() - 1);
+    for n in (1..=max).rev() {
+        if bytes[bytes.len() - n..] == tag_bytes[..n] {
+            return n;
+        }
+    }
+    0
+}
+
 /// Flush pending calls and terminate the stream. Idempotent enough for the
 /// unfold driver: it runs once when the body ends or `[DONE]` arrives.
 fn flush_acc(acc: &mut StreamAcc) -> Vec<ProviderEvent> {
@@ -503,6 +582,15 @@ fn flush_acc(acc: &mut StreamAcc) -> Vec<ProviderEvent> {
                 index: *index,
                 arguments: serde_json::from_str(&entry.args).unwrap_or_else(|_| json!({})),
             });
+        }
+    }
+    // An unclosed `<think>` (or held-back tail) still belongs somewhere.
+    let tail = std::mem::take(&mut acc.carry);
+    if !tail.is_empty() {
+        if acc.in_think {
+            out.push(ProviderEvent::ReasoningDelta { text: tail });
+        } else {
+            out.push(ProviderEvent::TextDelta { text: tail });
         }
     }
     out.push(ProviderEvent::Done);
@@ -636,6 +724,72 @@ mod tests {
             e,
             ProviderEvent::Usage { usage } if usage.input_tokens == 10 && usage.output_tokens == 5
         )));
+    }
+
+    fn chunk_with_text(t: &str) -> String {
+        serde_json::json!({"choices": [{"delta": {"content": t}, "finish_reason": null}]})
+            .to_string()
+    }
+
+    #[test]
+    fn think_tags_split_reasoning_from_answer() {
+        let mut acc = StreamAcc::default();
+        let out = map_chat_chunk(&mut acc, &chunk_with_text("<think>hmm, let me see</think>The answer."));
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[0],
+            ProviderEvent::ReasoningDelta { text } if text == "hmm, let me see"
+        ));
+        assert!(matches!(
+            &out[1],
+            ProviderEvent::TextDelta { text } if text == "The answer."
+        ));
+    }
+
+    #[test]
+    fn think_tags_survive_chunk_splits() {
+        let mut acc = StreamAcc::default();
+        let a = map_chat_chunk(&mut acc, &chunk_with_text("<thi"));
+        assert!(a.is_empty(), "partial tag must be held back");
+        let b = map_chat_chunk(&mut acc, &chunk_with_text("nk>deep thought</th"));
+        assert_eq!(b.len(), 1);
+        assert!(matches!(
+            &b[0],
+            ProviderEvent::ReasoningDelta { text } if text == "deep thought"
+        ));
+        let c = map_chat_chunk(&mut acc, &chunk_with_text("ink>done"));
+        assert!(matches!(
+            &c[0],
+            ProviderEvent::TextDelta { text } if text == "done"
+        ));
+    }
+
+    #[test]
+    fn unclosed_think_flushes_as_reasoning() {
+        let mut acc = StreamAcc::default();
+        let first = map_chat_chunk(&mut acc, &chunk_with_text("<think>abc</th"));
+        assert!(matches!(
+            &first[0],
+            ProviderEvent::ReasoningDelta { text } if text == "abc"
+        ));
+        // Held-back partial close tag + stream end.
+        let out = map_chat_chunk(&mut acc, "[DONE]");
+        assert!(matches!(
+            &out[0],
+            ProviderEvent::ReasoningDelta { text } if text == "</th"
+        ));
+        assert!(matches!(&out[1], ProviderEvent::Done));
+    }
+
+    #[test]
+    fn stray_close_tag_passes_through_as_text() {
+        let mut acc = StreamAcc::default();
+        let out = map_chat_chunk(&mut acc, &chunk_with_text("a</think>b"));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            ProviderEvent::TextDelta { text } if text == "a</think>b"
+        ));
     }
 
     #[test]

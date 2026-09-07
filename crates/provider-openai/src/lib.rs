@@ -114,6 +114,11 @@ impl ResponsesClient {
             "stream": true,
             "store": false,
         });
+        // The agent carries the system prompt separately from history; the
+        // Responses API takes it as `instructions`.
+        if let Some(system) = request.system.as_deref().filter(|s| !s.is_empty()) {
+            body["instructions"] = json!(system);
+        }
         if !request.tools.is_empty() {
             let tools: Vec<Value> = request
                 .tools
@@ -246,8 +251,19 @@ fn map_responses_event(ev: SseEvent) -> Vec<ProviderEvent> {
     match kind {
         "response.output_text.delta" => data["delta"]["text"]
             .as_str()
+            .filter(|t| !t.is_empty())
             .map(|t| {
                 vec![ProviderEvent::TextDelta {
+                    text: t.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        // Reasoning summaries (emitted when the model is asked for them).
+        "response.reasoning_summary_text.delta" => data["delta"]["text"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                vec![ProviderEvent::ReasoningDelta {
                     text: t.to_string(),
                 }]
             })
@@ -357,6 +373,20 @@ mod tests {
         let m = models::resolve_model("gpt-9.9-future");
         assert_eq!(m.id, "gpt-9.9-future");
         assert!(m.capabilities.tool_calling);
+    }
+
+    #[test]
+    fn reasoning_summary_maps() {
+        let ev = SseEvent {
+            event: None,
+            data: r#"{"type":"response.reasoning_summary_text.delta","delta":{"text":"checking"}}"#
+                .to_string(),
+        };
+        let out = map_responses_event(ev);
+        assert!(matches!(
+            &out[0],
+            ProviderEvent::ReasoningDelta { text } if text == "checking"
+        ));
     }
 
     #[test]

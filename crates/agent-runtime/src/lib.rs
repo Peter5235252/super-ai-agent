@@ -52,6 +52,13 @@ pub enum AgentEvent {
         session_id: SessionId,
         text: String,
     },
+    /// A chunk of the model's private reasoning for the current response.
+    /// Surfaced in the UI ("Thinking"); never sent back to providers.
+    ReasoningDelta {
+        task_id: TaskId,
+        session_id: SessionId,
+        text: String,
+    },
     ToolRequested {
         task_id: TaskId,
         session_id: SessionId,
@@ -67,6 +74,9 @@ pub enum AgentEvent {
         task_id: TaskId,
         session_id: SessionId,
         tool: String,
+        /// Matches the `id` of the requesting `ToolCall`, so the turn can
+        /// be replayed from persisted history.
+        tool_call_id: String,
         output: String,
         truncated: bool,
     },
@@ -89,6 +99,12 @@ pub enum AgentEvent {
         task_id: TaskId,
         session_id: SessionId,
         text: String,
+        /// The model's private reasoning for this turn (may be empty).
+        /// Surfaced in the UI; never fed back into history.
+        reasoning: String,
+        /// Tool calls requested in this turn (empty for a final answer).
+        /// Persisted alongside the text so reloaded history stays valid.
+        tool_calls: Vec<ToolCall>,
     },
     TaskFailed {
         task_id: TaskId,
@@ -248,9 +264,10 @@ impl Agent {
             };
 
             // Stream the model's response, with bounded retry on failure.
-            let (text, pending, usage) = match self.stream_turn(&req, task_id, &request).await {
-                Ok(parts) => parts,
-                Err(error) => {
+            let (text, reasoning, pending, usage) =
+                match self.stream_turn(&req, task_id, &request).await {
+                    Ok(parts) => parts,
+                    Err(error) => {
                     summary.status = TaskStatus::Failed;
                     summary.final_text = last_assistant_text(&messages);
                     self.emit(AgentEvent::TaskFailed {
@@ -278,6 +295,8 @@ impl Agent {
                 task_id,
                 session_id,
                 text,
+                reasoning,
+                tool_calls: tool_calls.clone(),
             });
 
             if tool_calls.is_empty() {
@@ -302,7 +321,16 @@ impl Agent {
                         "Error: unknown tool '{}'. Available: {}",
                         tc.name, available
                     );
-                    messages.push(Message::tool(tc.id.clone(), output));
+                    messages.push(Message::tool(tc.id.clone(), output.clone()));
+                    // Persisted via the event below so reloaded history stays paired.
+                    self.emit(AgentEvent::ToolOutput {
+                        task_id,
+                        session_id,
+                        tool: tc.name.clone(),
+                        tool_call_id: tc.id.clone(),
+                        output,
+                        truncated: false,
+                    });
                     continue;
                 };
                 let def = tool.definition().clone();
@@ -322,6 +350,7 @@ impl Agent {
                             task_id,
                             session_id,
                             tool: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
                             output: output.clone(),
                             truncated: false,
                         });
@@ -358,6 +387,7 @@ impl Agent {
                                 task_id,
                                 session_id,
                                 tool: tc.name.clone(),
+                                tool_call_id: tc.id.clone(),
                                 output: output.clone(),
                                 truncated: false,
                             });
@@ -386,6 +416,7 @@ impl Agent {
                             task_id,
                             session_id,
                             tool: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
                             output: r.output.clone(),
                             truncated: r.truncated,
                         });
@@ -396,6 +427,7 @@ impl Agent {
                             task_id,
                             session_id,
                             tool: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
                             output: format!("Error: {error}"),
                             truncated: false,
                         });
@@ -421,7 +453,7 @@ impl Agent {
         req: &TaskRequest,
         task_id: TaskId,
         request: &AgentRequest,
-    ) -> Result<(String, PendingCalls, UsageEstimate), String> {
+    ) -> Result<(String, String, PendingCalls, UsageEstimate), String> {
         let mut attempt = 0;
         loop {
             match self.try_stream_turn(req, task_id, request).await {
@@ -444,7 +476,7 @@ impl Agent {
         req: &TaskRequest,
         task_id: TaskId,
         request: &AgentRequest,
-    ) -> Result<(String, PendingCalls, UsageEstimate), String> {
+    ) -> Result<(String, String, PendingCalls, UsageEstimate), String> {
         let session_id = req.session_id;
 
         let mut stream = req
@@ -454,6 +486,7 @@ impl Agent {
             .map_err(|e| format!("{e}"))?;
 
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut pending: PendingCalls = PendingCalls::new();
         let mut usage = UsageEstimate::default();
         let mut completed = false;
@@ -463,6 +496,14 @@ impl Agent {
                 ProviderEvent::TextDelta { text: t } => {
                     text.push_str(&t);
                     self.emit(AgentEvent::ModelDelta {
+                        task_id,
+                        session_id,
+                        text: t,
+                    });
+                }
+                ProviderEvent::ReasoningDelta { text: t } => {
+                    reasoning.push_str(&t);
+                    self.emit(AgentEvent::ReasoningDelta {
                         task_id,
                         session_id,
                         text: t,
@@ -511,7 +552,7 @@ impl Agent {
             }
         }
 
-        Ok((text, pending, usage))
+        Ok((text, reasoning, pending, usage))
     }
 }
 
