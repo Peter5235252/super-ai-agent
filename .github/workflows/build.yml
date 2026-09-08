@@ -2,7 +2,7 @@ name: build-windows
 
 on:
   push:
-    branches: [main]
+    branches: [main, tauri-shell]
   workflow_dispatch:
 
 jobs:
@@ -10,6 +10,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Generate Tauri icons if missing
+        shell: pwsh
+        run: |
+          if ((Test-Path "src-tauri/icons") -and (Get-ChildItem "src-tauri/icons" | Where-Object { $_.Length -gt 0 })) {
+            Write-Output "icons already present"
+          } elseif (Test-Path "scripts/generate-icons.ps1") {
+            pwsh scripts/generate-icons.ps1
+          } else {
+            New-Item -ItemType Directory -Path "src-tauri/icons" -Force | Out-Null
+            $head = Invoke-WebRequest -Uri "https://picsum.photos/256" -UseBasicParsing -OutFile "src-tauri/icons/icon.png" -ErrorAction SilentlyContinue
+            Copy-Item "src-tauri/icons/icon.png" "src-tauri/icons/icon.ico" -ErrorAction SilentlyContinue
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
