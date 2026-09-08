@@ -2,8 +2,10 @@ Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = "Stop"
 
 Add-Type -TypeDefinition @"
+using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 public static class GfxExt {
     public static void FillRoundedRectangle(Graphics g, Brush b, int x, int y, int w, int h, int r) {
         GraphicsPath p = new GraphicsPath();
@@ -15,6 +17,7 @@ public static class GfxExt {
         g.FillPath(b, p);
         p.Dispose();
     }
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
 }
 "@ -ReferencedAssemblies System.Drawing
 
@@ -57,21 +60,42 @@ function New-IconBitmap([int]$size) {
     return $bmp
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $repoRoot) { $repoRoot = (Get-Location).Path }
+$repoRoot = $PSScriptRoot
+if (-not $repoRoot -or -not (Test-Path (Join-Path $repoRoot "Cargo.toml"))) {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+}
+if (-not $repoRoot -or -not (Test-Path (Join-Path $repoRoot "Cargo.toml"))) {
+    $repoRoot = (Get-Location).Path
+}
 $outDir = Join-Path $repoRoot "src-tauri/icons"
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
+# 512 source for PNGs
 $bmp512 = New-IconBitmap 512
 $bmp512.Save((Join-Path $outDir "icon.png"), [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp128 = New-Object System.Drawing.Bitmap($bmp512, (New-Object System.Drawing.Size(128, 128)))
 $bmp128.Save((Join-Path $outDir "128x128.png"), [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp32 = New-Object System.Drawing.Bitmap($bmp512, (New-Object System.Drawing.Size(32, 32)))
+
+# ICO must be BMP-backed for RC 3.00 — build from a 32px HICON, not a PNG.
 $bmp32.Save((Join-Path $outDir "32x32.png"), [System.Drawing.Imaging.ImageFormat]::Png)
-$bmp256 = New-Object System.Drawing.Bitmap($bmp512, (New-Object System.Drawing.Size(256, 256)))
-$bmp256.Save((Join-Path $outDir "icon.ico"), [System.Drawing.Imaging.ImageFormat]::Icon)
-$bmp256.Dispose()
-$bmp32.Dispose()
+$h = $bmp32.GetHicon()
+try {
+    $icon = [System.Drawing.Icon]::FromHandle($h)
+    try {
+        $fs = [System.IO.File]::Create((Join-Path $outDir "icon.ico"))
+        try {
+            $icon.Save($fs)
+        } finally {
+            $fs.Dispose()
+        }
+    } finally {
+        $icon.Dispose()
+    }
+} finally {
+    [GfxExt]::DestroyIcon($h) | Out-Null
+    $bmp32.Dispose()
+}
 $bmp128.Dispose()
 $bmp512.Dispose()
 Get-ChildItem $outDir | Select-Object Name, Length | Format-Table -AutoSize
