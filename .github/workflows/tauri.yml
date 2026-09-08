@@ -1,0 +1,59 @@
+name: tauri-bundle
+
+# Builds the Tauri web shell (React + Rust) and bundles Windows installers.
+# The raw exe also ships in the artifact for quick testing without installing.
+on:
+  push:
+    branches: [tauri-shell]
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm install
+
+      - name: Generate Tauri icons if missing
+        shell: pwsh
+        run: |
+          if ((Test-Path "src-tauri/icons") -and (Get-ChildItem "src-tauri/icons" | Where-Object { $_.Length -gt 0 })) {
+            Write-Output "icons already present"
+          } elseif (Test-Path "scripts/generate-icons.ps1") {
+            pwsh scripts/generate-icons.ps1
+          } else {
+            throw "src-tauri/icons is missing and no generator script found"
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tauri-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Tauri app + bundles
+        run: npx --prefix frontend tauri build
+
+      - name: Upload Windows exe + installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-ai-tauri-windows
+          path: |
+            target/release/super-ai.exe
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error
